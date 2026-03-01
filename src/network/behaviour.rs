@@ -1,10 +1,11 @@
 use libp2p::{
-    gossipsub, kad, mdns, ping, request_response,
+    gossipsub, kad, mdns, ping, request_response, autonat, identify,
     swarm::NetworkBehaviour,
     PeerId,
 };
 use anyhow::Result;
 use crate::protocol::{self, MessageCodec};
+use crate::network::kad_store::PersistentStore;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
@@ -14,14 +15,28 @@ pub struct MyBehaviour {
     pub ping: ping::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub request_response: request_response::Behaviour<MessageCodec>,
-    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub kademlia: kad::Behaviour<PersistentStore>,
     pub gossipsub: gossipsub::Behaviour,
+    pub autonat: autonat::Behaviour,
+    pub identify: identify::Behaviour,
 }
 
 impl MyBehaviour {
-    pub fn new(peer_id: PeerId) -> Result<Self> {
-        let store = kad::store::MemoryStore::new(peer_id);
-        let kademlia = kad::Behaviour::new(peer_id, store);
+    pub fn new(
+        peer_id: PeerId,
+        keypair: &libp2p::identity::Keypair,
+    ) -> Result<Self> {
+        let storage_path = std::env::var("VIDEOCALLS_STORAGE_PATH")
+            .unwrap_or_else(|_| ".videocalls/storage".to_string());
+        let kad_store_path = std::path::PathBuf::from(storage_path).join("kad_store");
+
+        let _ = std::fs::create_dir_all(&kad_store_path);
+
+        let store = PersistentStore::new(kad_store_path, peer_id)
+            .map_err(|e| anyhow::anyhow!("Failed to create persistent kad store: {}", e))?;
+        let mut kademlia = kad::Behaviour::new(peer_id, store);
+
+        kademlia.set_mode(Some(kad::Mode::Server));
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_secs(1))
@@ -35,12 +50,31 @@ impl MyBehaviour {
             .map_err(|e| anyhow::anyhow!("Gossipsub config error: {}", e))?;
 
         let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(
-                libp2p::identity::Keypair::generate_ed25519()
-            ),
+            gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create gossipsub client: {}", e))?;
+
+        let autonat = autonat::Behaviour::new(
+            peer_id,
+            autonat::Config {
+                retry_interval: Duration::from_secs(90),
+                refresh_interval: Duration::from_secs(30 * 60),
+                boot_delay: Duration::from_secs(5),
+                throttle_server_period: Duration::ZERO,
+                only_global_ips: true,
+                ..Default::default()
+            },
+        );
+
+        let identify = identify::Behaviour::new(
+            identify::Config::new(
+                "/videocalls/1.0.0".to_string(),
+                keypair.public(),
+            )
+            .with_push_listen_addr_updates(true)
+            .with_interval(Duration::from_secs(5 * 60))
+        );
 
         Ok(Self {
             ping: ping::Behaviour::new(ping::Config::new()),
@@ -51,6 +85,8 @@ impl MyBehaviour {
             request_response: protocol::create_behaviour(),
             kademlia,
             gossipsub,
+            autonat,
+            identify,
         })
     }
 
@@ -90,5 +126,9 @@ impl MyBehaviour {
         self.kademlia
             .bootstrap()
             .map_err(|e| anyhow::anyhow!("Bootstrap failed: {:?}", e))
+    }
+
+    pub fn get_closest_peers(&mut self, peer_id: PeerId) -> kad::QueryId {
+        self.kademlia.get_closest_peers(peer_id)
     }
 }

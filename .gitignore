@@ -21,3 +21,4 @@ Cargo.lock
 
 plans/
 .videocalls/
+node_modules/
