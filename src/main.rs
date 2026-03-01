@@ -7,6 +7,7 @@ mod crypto;
 
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 #[tokio::main]
@@ -24,14 +25,21 @@ async fn main() -> Result<()> {
     let identity = identity::Identity::load_or_generate(&identity_path)?;
     info!("PeerId: {}", identity.peer_id());
 
-    let mut network = network::P2PNetwork::new(&identity)?;
+    let storage_path = std::env::var("VIDEOCALLS_STORAGE_PATH")
+        .unwrap_or_else(|_| ".videocalls/storage".to_string());
+    let storage_path = PathBuf::from(storage_path);
+
+    let storage = Arc::new(storage::Storage::new(&storage_path)?);
+    info!("📦 Storage initialized at {:?}", storage_path);
+
+    let mut network = network::P2PNetwork::new(&identity, storage.clone())?;
     network.listen("/ip4/0.0.0.0/tcp/0")?;
 
     let command_tx = network.command_sender();
     let event_rx = network.event_receiver();
 
     let cli_handle = tokio::spawn(async move {
-        let mut cli = cli::CLI::new(command_tx, event_rx);
+        let mut cli = cli::CLI::new(command_tx, event_rx, storage);
         cli.run().await
     });
 

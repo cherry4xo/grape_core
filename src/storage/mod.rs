@@ -107,6 +107,50 @@ impl Storage {
         Ok(contacts)
     }
 
+    pub fn remove_contact(&self, peer_id: &PeerId) -> Result<()> {
+        let contacts_tree = self.db.open_tree("contacts")?;
+        let key = peer_id.to_string();
+        contacts_tree.remove(key.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        let messages_tree = self.db.open_tree("messages")?;
+        let mut messages = Vec::new();
+
+        for item in messages_tree.iter().rev() {
+            let (_, value) = item?;
+            let message: StoredMessage = bincode::deserialize(&value)?;
+
+            if message.content.to_lowercase().contains(&query.to_lowercase()) {
+                messages.push(message);
+
+                if messages.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
+    pub fn get_message_count(&self, chat_id: &str) -> Result<usize> {
+        let messages_tree = self.db.open_tree("messages")?;
+        let prefix = format!("_{}_", chat_id);
+        let count = messages_tree.iter()
+            .filter(|item| {
+                if let Ok((key, _)) = item {
+                    let key_str = String::from_utf8_lossy(key);
+                    key_str.contains(&prefix)
+                } else {
+                    false
+                }
+            })
+            .count();
+
+        Ok(count)
+    }
+
     pub fn update_last_seen(&self, peer_id: &PeerId, timestamp: i64) -> Result<()> {
         let contacts_tree = self.db.open_tree("contacts")?;
 
@@ -128,6 +172,23 @@ impl Storage {
         contacts_tree.insert(key.as_bytes(), value)?;
 
         Ok(())
+    }
+
+    pub fn find_contact_by_name(&self, name: &str) -> Result<Option<Contact>> {
+        let contacts_tree = self.db.open_tree("contacts")?;
+
+        for item in contacts_tree.iter() {
+            let (_, value) = item?;
+            let contact: Contact = bincode::deserialize(&value)?;
+
+            if let Some(contact_name) = &contact.name {
+                if contact_name.eq_ignore_ascii_case(name) {
+                    return Ok(Some(contact));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn clear(&self) -> Result<()> {
