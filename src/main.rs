@@ -1,5 +1,9 @@
 mod identity;
 mod network;
+mod protocol;
+mod cli;
+mod storage;
+mod crypto;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -7,22 +11,42 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber.fmt()
+    tracing_subscriber::fmt()
         .with_env_filter("info,libp2p=debug")
         .init();
 
     info!("VideoCalls P2P Node");
 
-    let identity_path = PathBuf::from(".videocalls/identity.key");
+    let identity_path = std::env::var("VIDEOCALLS_IDENTITY_PATH")
+        .unwrap_or_else(|_| ".videocalls/identity.key".to_string());
+    let identity_path = PathBuf::from(identity_path);
 
     let identity = identity::Identity::load_or_generate(&identity_path)?;
     info!("PeerId: {}", identity.peer_id());
 
     let mut network = network::P2PNetwork::new(&identity)?;
-
     network.listen("/ip4/0.0.0.0/tcp/0")?;
 
-    network.run().await?;
+    let command_tx = network.command_sender();
+    let event_rx = network.event_receiver();
+
+    let cli_handle = tokio::spawn(async move {
+        let mut cli = cli::CLI::new(command_tx, event_rx);
+        cli.run().await
+    });
+
+    let network_handle = tokio::spawn(async move {
+        network.run().await
+    });
+
+    tokio::select! {
+        result = cli_handle => {
+            result??;
+        }
+        result = network_handle => {
+            result??;
+        }
+    }
 
     Ok(())
 }

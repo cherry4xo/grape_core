@@ -67,8 +67,6 @@ impl Identity {
 
 #[cfg(test)]
 mod tests {
-    use crate::identity;
-
     use super::*;
     use std::env;
 
