@@ -1,6 +1,7 @@
 pub mod behaviour;
 pub mod transport;
 pub mod bootstrap;
+pub mod kad_store;
 
 use std::collections::HashMap;
 
@@ -10,7 +11,7 @@ use crate::crypto::MessageEncryption;
 use crate::storage::{Storage, StoredMessage};
 use anyhow::Result;
 use std::sync::Arc;
-use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, request_response};
+use libp2p::{Multiaddr, PeerId, Swarm, autonat, gossipsub, identify, kad, request_response};
 use libp2p::request_response::OutboundRequestId;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
@@ -24,6 +25,11 @@ pub enum NetworkCommand {
     UnsubscribeChannel { topic: String },
     PublishToChannel { topic: String, message: String },
     ListChannels,
+    Bootstrap,
+    FindPeer { peer_id: PeerId },
+    GetProviders { key: String },
+    GetDhtStats,
+    GetNatStatus,
     Shutdown,
 }
 
@@ -54,7 +60,9 @@ impl P2PNetwork {
         let peer_id = *identity.peer_id();
 
         let transport = transport::build_transport(&keypair)?;
-        let behaviour = behaviour::MyBehaviour::new(peer_id)?;
+        let mut behaviour = behaviour::MyBehaviour::new(peer_id, &keypair)?;
+
+        bootstrap::setup_bootstrap(&mut behaviour);
 
         let swarm = Swarm::new(
             transport,
@@ -68,7 +76,6 @@ impl P2PNetwork {
         let (command_tx, command_rx) = mpsc::channel(100);
         let (event_tx, _) = broadcast::channel(100);
         let pending_requests = HashMap::new();
-
         let encryption = MessageEncryption::new(keypair.clone());
 
         Ok(Self {
@@ -200,6 +207,58 @@ impl P2PNetwork {
                         NetworkCommand::ListChannels => {
                             let subscriptions = self.swarm.behaviour().subscriptions();
                             info!("Subscribed channels: {:?}", subscriptions);
+                        }
+
+                        NetworkCommand::Bootstrap => {
+                            info!("🚀 Triggering manual bootstrap...");
+                            match self.swarm.behaviour_mut().bootstrap() {
+                                Ok(query_id) => {
+                                    info!("✅ Bootstrap query started: {:?}", query_id);
+                                }
+                                Err(e) => {
+                                    warn!("❌ Bootstrap failed: {:?}", e);
+                                }
+                            }
+                        }
+
+                        NetworkCommand::FindPeer { peer_id } => {
+                            info!("🔍 Finding peer {} in DHT...", peer_id);
+                            let query_id = self.swarm.behaviour_mut().get_closest_peers(peer_id);
+                            info!("📡 DHT query started: {:?}", query_id);
+                        }
+
+                        NetworkCommand::GetProviders { key } => {
+                            info!("🔍 Getting providers for key: {}", key);
+                            // TODO: Implement kad::get_providers when needed
+                            warn!("⚠️ GetProviders not yet implemented");
+                        }
+
+                        NetworkCommand::GetDhtStats => {
+                            let mut kad_peers = Vec::new();
+                            for bucket in self.swarm.behaviour_mut().kademlia.kbuckets() {
+                                for entry in bucket.iter() {
+                                    kad_peers.push(entry.node.key.preimage().clone());
+                                }
+                            }
+
+                            info!("📊 DHT Routing Table:");
+                            info!("  Total peers in routing table: {}", kad_peers.len());
+                            info!("  Connected peers: {}", self.swarm.connected_peers().count());
+
+                            if !kad_peers.is_empty() {
+                                info!("  Peers in DHT:");
+                                for peer in kad_peers.iter().take(10) {
+                                    info!("    - {}", peer);
+                                }
+                                if kad_peers.len() > 10 {
+                                    info!("    ... and {} more", kad_peers.len() - 10);
+                                }
+                            }
+                        }
+
+                        NetworkCommand::GetNatStatus => {
+                            info!("🌐 NAT status information is logged via Autonat events");
+                            info!("   Watch for 'NAT status changed' messages in the logs");
                         }
                     }
                 }
@@ -413,21 +472,47 @@ impl P2PNetwork {
                         SwarmEvent::Behaviour(behaviour::MyBehaviourEvent::Kademlia(event)) => {
                             match event {
                                 kad::Event::RoutingUpdated { peer, .. } => {
-                                    debug!("Routing updated for peer: {}", peer);
+                                    debug!("📊 Routing table updated for peer: {}", peer);
                                 }
                                 kad::Event::RoutablePeer { peer, address } => {
-                                    debug!("Routable peer: {} at {}", peer, address);
+                                    info!("✅ Routable peer discovered: {} at {}", peer, address);
                                 }
                                 kad::Event::UnroutablePeer { peer } => {
-                                    debug!("Unroutable peer: {}", peer);
+                                    warn!("❌ Unroutable peer: {}", peer);
                                 }
                                 kad::Event::OutboundQueryProgressed { result, .. } => {
                                     match result {
                                         kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { peer, num_remaining })) => {
-                                            info!("Bootstrap succeeded with peer {}, {} remaining", peer, num_remaining);
+                                            info!("🚀 Bootstrap succeeded with peer {}, {} remaining", peer, num_remaining);
+
+                                            if num_remaining == 0 {
+                                                info!("✅ Bootstrap completed! DHT is ready.");
+                                            }
                                         }
                                         kad::QueryResult::Bootstrap(Err(kad::BootstrapError::Timeout { .. })) => {
-                                            warn!("Bootstrap timeout");
+                                            warn!("⏱️ Bootstrap timeout - will retry");
+                                        }
+                                        kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { peers, .. })) => {
+                                            info!("🔍 Found {} closest peers", peers.len());
+                                            
+                                            for peer in peers {
+                                                debug!("  - {:?}", peer);
+                                            }
+                                        }
+                                        kad::QueryResult::GetClosestPeers(Err(e)) => {
+                                            warn!("❌ GetClosestPeers failed: {:?}", e);
+                                        }
+                                        kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(record))) => {
+                                            info!("📦 Found DHT record: {:?}", record.record.key);
+                                        }
+                                        kad::QueryResult::GetRecord(Err(e)) => {
+                                            debug!("❌ GetRecord failed: {:?}", e);
+                                        }
+                                        kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
+                                            info!("✅ Successfully put record to DHT: {:?}", key);
+                                        }
+                                        kad::QueryResult::PutRecord(Err(e)) => {
+                                            warn!("❌ PutRecord failed: {:?}", e);
                                         }
                                         _ => {}
                                     }
@@ -455,6 +540,55 @@ impl P2PNetwork {
                             gossipsub::Event::Subscribed { peer_id, topic }
                         )) => {
                             info!("Peer {} subscribed to {}", peer_id, topic);
+                        }
+
+                        SwarmEvent::Behaviour(behaviour::MyBehaviourEvent::Autonat(event)) => {
+                            match event {
+                                autonat::Event::InboundProbe(e) => {
+                                    debug!("🔍 Autonat inbound probe: {:?}", e);
+                                }
+                                autonat::Event::OutboundProbe(e) => {
+                                    debug!("🔍 Autonat outbound probe: {:?}", e);
+                                }
+                                autonat::Event::StatusChanged { old, new } => {
+                                    info!("🌐 NAT status changed: {:?} -> {:?}", old, new);
+                                    match new {
+                                        autonat::NatStatus::Public(addr) => {
+                                            info!("✅ We are publicly reachable at: {:?}", addr);
+                                        }
+                                        autonat::NatStatus::Private => {
+                                            info!("⚠️ We are behind NAT (private network)");
+                                        }
+                                        autonat::NatStatus::Unknown => {
+                                            info!("❓ NAT status unknown");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        SwarmEvent::Behaviour(behaviour::MyBehaviourEvent::Identify(event)) => {
+                            match event {
+                                identify::Event::Received { peer_id, info, .. } => {
+                                    info!("📝 Received identify info from {}", peer_id);
+                                    debug!("  Protocol version: {}", info.protocol_version);
+                                    debug!("  Agent version: {}", info.agent_version);
+                                    debug!("  Protocols: {:?}", info.protocols);
+                                    
+                                    for addr in info.listen_addrs {
+                                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                                    }
+                                }
+                                identify::Event::Sent { .. } => {
+                                    debug!("📤 Sent identify info");
+                                }
+                                identify::Event::Pushed { .. } => {
+                                    debug!("📤 Pushed identify info");
+                                }
+                                identify::Event::Error { peer_id, error, .. } => {
+                                    warn!("❌ Identify error with {}: {:?}", peer_id, error);
+                                }
+                            }
                         }
 
                         _ => {}

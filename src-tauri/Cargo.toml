@@ -1,0 +1,27 @@
+[package]
+name = "videocalls-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "videocalls_app"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "videocalls-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable", "devtools"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Используем родительский проект как библиотеку
+videocalls = { path = ".." }

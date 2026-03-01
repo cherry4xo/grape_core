@@ -144,6 +144,10 @@ impl CLI {
                 println!("  channel list                   - List subscribed channels");
                 println!("  listen                         - Show listen addresses");
                 println!("  identity                       - Show your PeerId");
+                println!("  bootstrap                      - Trigger DHT bootstrap");
+                println!("  findpeer <peer_id>             - Find peer in DHT");
+                println!("  dht                            - Show DHT routing table stats");
+                println!("  nat                            - Show NAT status");
                 println!("  quit                           - Exit\n");
             }
 
@@ -444,6 +448,38 @@ impl CLI {
                         println!("❌ Failed to search messages: {:?}", e);
                     }
                 }
+            }
+            "bootstrap" => {
+                println!("🚀 Triggering DHT bootstrap...");
+                self.command_tx
+                    .send(NetworkCommand::Bootstrap)
+                    .await?;
+            }
+            "findpeer" => {
+                if parts.len() < 2 {
+                    println!("Usage: findpeer <peer_id>");
+                    return Ok(());
+                }
+
+                let peer_id: PeerId = parts[1].parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid PeerId"))?;
+
+                println!("🔍 Searching for peer {} in DHT...", peer_id);
+                self.command_tx
+                    .send(NetworkCommand::FindPeer { peer_id })
+                    .await?;
+            }
+            "dht" => {
+                println!("📊 Fetching DHT routing table stats...");
+                self.command_tx
+                    .send(NetworkCommand::GetDhtStats)
+                    .await?;
+            }
+            "nat" => {
+                println!("🌐 Checking NAT status...");
+                self.command_tx
+                    .send(NetworkCommand::GetNatStatus)
+                    .await?;
             }
             _ => {
                 println!("Unknown command: {}. Type 'help' for available commands.", parts[0]);
