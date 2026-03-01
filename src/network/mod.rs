@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use crate::identity::Identity;
 use crate::protocol::Message;
 use crate::crypto::MessageEncryption;
+use crate::storage::{Storage, StoredMessage};
 use anyhow::Result;
+use std::sync::Arc;
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, request_response};
 use libp2p::request_response::OutboundRequestId;
 use tokio::sync::{broadcast, mpsc};
@@ -42,15 +44,16 @@ pub struct P2PNetwork {
     event_tx: broadcast::Sender<NetworkEvent>,
     pending_requests: HashMap<OutboundRequestId, PeerId>,
     encryption: MessageEncryption,
+    storage: Arc<Storage>,
+    local_peer_id: PeerId,
 }
 
 impl P2PNetwork {
-    pub fn new(identity: &Identity) -> Result<Self> {
+    pub fn new(identity: &Identity, storage: Arc<Storage>) -> Result<Self> {
         let keypair = identity.keypair().clone();
         let peer_id = *identity.peer_id();
 
         let transport = transport::build_transport(&keypair)?;
-
         let behaviour = behaviour::MyBehaviour::new(peer_id)?;
 
         let swarm = Swarm::new(
@@ -75,6 +78,8 @@ impl P2PNetwork {
             event_tx,
             pending_requests,
             encryption,
+            storage,
+            local_peer_id: peer_id
         })
     }
 
@@ -120,6 +125,19 @@ impl P2PNetwork {
                         }
                         NetworkCommand::SendMessage { peer_id, message } => {
                             info!("📤 Sending message to {}: {}", peer_id, message);
+
+                            let stored_msg = StoredMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                chat_id: peer_id.to_string(),
+                                sender: self.local_peer_id.to_string(),
+                                content: message.clone(),
+                                timestamp: chrono::Utc::now().timestamp(),
+                                is_outgoing: true,
+                            };
+
+                            if let Err(e) = self.storage.save_message(&stored_msg) {
+                                warn!("❌ Failed to save outgoing message: {:?}", e);
+                            }
 
                             if keys_exchanged.get(&peer_id).copied().unwrap_or(false) {
                                 match self.encryption.encrypt(&peer_id, message.as_bytes()) {
@@ -221,6 +239,12 @@ impl P2PNetwork {
                             info!("✅ Connected to {} at {}", peer_id, endpoint.get_remote_address());
                             let _ = self.event_tx.send(NetworkEvent::PeerConnected { peer_id });
 
+                            if let Err(e) = self.storage.update_last_seen(&peer_id, chrono::Utc::now().timestamp()) {
+                                warn!("❌ Failed to save contact: {:?}", e);
+                            } else {
+                                info!("💾 Contact saved: {}", peer_id);
+                            }
+
                             if !keys_exchanged.contains_key(&peer_id) {
                                 let my_public_key = self.encryption.public_key();
 
@@ -293,6 +317,19 @@ impl P2PNetwork {
                                         Message::Text { context, timestamp } => {
                                             info!("📨 Received request from {}: {:?}", peer, request);
 
+                                            let stored_msg = StoredMessage {
+                                                id: uuid::Uuid::new_v4().to_string(),
+                                                chat_id: peer.to_string(),
+                                                sender: peer.to_string(),
+                                                content: context.clone(),
+                                                timestamp: *timestamp,
+                                                is_outgoing: false,
+                                            };
+
+                                            if let Err(e) = self.storage.save_message(&stored_msg) {
+                                                warn!("❌ Failed to save incoming message: {:?}", e);
+                                            }
+
                                             let _ = self.event_tx.send(NetworkEvent::MessageReceived {
                                                 peer_id: peer,
                                                 message: context.clone(),
@@ -313,6 +350,19 @@ impl P2PNetwork {
                                                     let message = String::from_utf8_lossy(&plaintext).to_string();
                                                     info!("✅ Decrypted: {}", message);
 
+                                                    let stored_msg = StoredMessage {
+                                                        id: uuid::Uuid::new_v4().to_string(),
+                                                        chat_id: peer.to_string(),
+                                                        sender: peer.to_string(),
+                                                        content: message.clone(),
+                                                        timestamp: *timestamp,
+                                                        is_outgoing: false,
+                                                    };
+
+                                                    if let Err(e) = self.storage.save_message(&stored_msg) {
+                                                        warn!("❌ Failed to save incoming message: {:?}", e);
+                                                    }
+                                                    
                                                     let _ = self.event_tx.send(NetworkEvent::MessageReceived {
                                                         peer_id: peer,
                                                         message,
