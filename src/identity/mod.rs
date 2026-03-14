@@ -42,6 +42,11 @@ impl Identity {
         Ok(Self { keypair, peer_id })
     }
 
+    pub fn from_keypair(keypair: Keypair) -> Self {
+        let peer_id = PeerId::from(keypair.public());
+        Self { keypair, peer_id }
+    }
+
     pub fn load_or_generate(path: &Path) -> Result<Self> {
         if path.exists() {
             Self::load(path)

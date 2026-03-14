@@ -5,27 +5,14 @@ use rand_core::OsRng;
 use ring::aead::{Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, AES_256_GCM};
 use x25519_dalek::{PublicKey, StaticSecret};
 use std::collections::HashMap;
-use std::error::Error;
-use std::fmt;
-
-#[derive(Debug)]
-pub struct CryptoError(String);
-
-impl fmt::Display for CryptoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Crypto error: {}", self.0)
-    }
-}
-
-impl Error for CryptoError {}
 
 struct CounterNonceSequence {
     counter: u64,
 }
 
 impl CounterNonceSequence {
-    fn new() -> Self {
-        Self { counter: 0 }
+    fn new(start: u64) -> Self {
+        Self { counter: start }
     }
 }
 
@@ -43,6 +30,8 @@ pub struct MessageEncryption {
     my_x25519_secret_bytes: [u8; 32],
     my_x25519_public: PublicKey,
     peer_shared_secrets: HashMap<PeerId, Vec<u8>>,
+    encrypt_counters: HashMap<PeerId, u64>,
+    decrypt_counters: HashMap<PeerId, u64>,
 }
 
 impl MessageEncryption {
@@ -56,6 +45,8 @@ impl MessageEncryption {
             my_x25519_secret_bytes,
             my_x25519_public,
             peer_shared_secrets: HashMap::new(),
+            encrypt_counters: HashMap::new(),
+            decrypt_counters: HashMap::new(),
         }
     }
 
@@ -76,18 +67,26 @@ impl MessageEncryption {
         let shared_secret = my_secret.diffie_hellman(&peer_public);
 
         self.peer_shared_secrets.insert(peer_id, shared_secret.as_bytes().to_vec());
+        self.encrypt_counters.entry(peer_id).or_insert(0);
+        self.decrypt_counters.entry(peer_id).or_insert(0);
         Ok(())
     }
 
-    pub fn encrypt(&self, peer_id: &PeerId, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn encrypt(&mut self, peer_id: &PeerId, data: &[u8]) -> Result<Vec<u8>> {
         let shared_secret = self.peer_shared_secrets
             .get(peer_id)
-            .context("No shared secret for peer")?;
+            .context("No shared secret for peer")?
+            .clone();
+
+        let counter = self.encrypt_counters.get_mut(peer_id)
+            .context("No encrypt counter for peer")?;
+        let current = *counter;
+        *counter += 1;
 
         let unbound_key = UnboundKey::new(&AES_256_GCM, &shared_secret[..32])
             .map_err(|e| anyhow::anyhow!("Failed to create key: {:?}", e))?;
 
-        let mut sealing_key = SealingKey::new(unbound_key, CounterNonceSequence::new());
+        let mut sealing_key = SealingKey::new(unbound_key, CounterNonceSequence::new(current));
 
         let mut in_out = data.to_vec();
         sealing_key
@@ -97,15 +96,21 @@ impl MessageEncryption {
         Ok(in_out)
     }
 
-    pub fn decrypt(&self, peer_id: &PeerId, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt(&mut self, peer_id: &PeerId, data: &[u8]) -> Result<Vec<u8>> {
         let shared_secret = self.peer_shared_secrets
             .get(peer_id)
-            .context("No shared secret for peer")?;
+            .context("No shared secret for peer")?
+            .clone();
+
+        let counter = self.decrypt_counters.get_mut(peer_id)
+            .context("No decrypt counter for peer")?;
+        let current = *counter;
+        *counter += 1;
 
         let unbound_key = UnboundKey::new(&AES_256_GCM, &shared_secret[..32])
             .map_err(|e| anyhow::anyhow!("Failed to create key: {:?}", e))?;
 
-        let mut opening_key = OpeningKey::new(unbound_key, CounterNonceSequence::new());
+        let mut opening_key = OpeningKey::new(unbound_key, CounterNonceSequence::new(current));
 
         let mut in_out = data.to_vec();
         let plaintext = opening_key
@@ -142,5 +147,27 @@ mod tests {
         let decrypted = crypto2.decrypt(&peer_id1, &encrypted).unwrap();
 
         assert_eq!(message, decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_nonce_increments() {
+        let keypair1 = Keypair::generate_ed25519();
+        let keypair2 = Keypair::generate_ed25519();
+
+        let peer_id1 = PeerId::from(keypair1.public());
+        let peer_id2 = PeerId::from(keypair2.public());
+
+        let mut crypto1 = MessageEncryption::new(keypair1);
+        let mut crypto2 = MessageEncryption::new(keypair2);
+
+        crypto1.add_peer(peer_id2, &crypto2.public_key()).unwrap();
+        crypto2.add_peer(peer_id1, &crypto1.public_key()).unwrap();
+
+        for i in 0..5u8 {
+            let msg = vec![i; 10];
+            let enc = crypto1.encrypt(&peer_id2, &msg).unwrap();
+            let dec = crypto2.decrypt(&peer_id1, &enc).unwrap();
+            assert_eq!(msg, dec);
+        }
     }
 }

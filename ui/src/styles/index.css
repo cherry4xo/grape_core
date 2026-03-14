@@ -161,12 +161,6 @@ input:focus, textarea:focus {
   margin-right: auto;
 }
 
-.message-sender {
-  font-size: 12px;
-  color: #888;
-  margin-bottom: 4px;
-}
-
 .message-content {
   background-color: #2d2d2d;
   padding: 8px 12px;
@@ -176,12 +170,6 @@ input:focus, textarea:focus {
 
 .message.outgoing .message-content {
   background-color: #2563eb;
-}
-
-.message-timestamp {
-  font-size: 11px;
-  color: #666;
-  margin-top: 4px;
 }
 
 .message-input-container {
@@ -289,3 +277,114 @@ input:focus, textarea:focus {
   padding: 32px;
 }
 
+/* Auth Screen */
+.auth-screen {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #1a1a1a;
+}
+
+.auth-card {
+  background-color: #242424;
+  border: 1px solid #404040;
+  border-radius: 12px;
+  padding: 40px;
+  width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.auth-card h1 {
+  font-size: 28px;
+  font-weight: 700;
+  margin: 0;
+  text-align: center;
+}
+
+.auth-card h2 {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.auth-subtitle {
+  color: #888;
+  font-size: 14px;
+  text-align: center;
+}
+
+.auth-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mnemonic-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  background-color: #1a1a1a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.mnemonic-word {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: #2d2d2d;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.word-index {
+  color: #666;
+  font-size: 11px;
+  min-width: 16px;
+}
+
+.word-text {
+  font-family: monospace;
+  font-size: 13px;
+}
+
+.auth-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.auth-option label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.auth-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.auth-input {
+  width: 100%;
+}
+
+.auth-textarea {
+  width: 100%;
+  resize: vertical;
+  font-family: monospace;
+}
+
+.auth-error {
+  color: #ef4444;
+  font-size: 13px;
+}

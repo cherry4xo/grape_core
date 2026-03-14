@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod identity;
 pub mod network;
 pub mod cli;

@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 
 export interface PeerConnectedEvent {
@@ -22,45 +22,31 @@ export function useNetworkEvents(callbacks: {
   onMessageReceived?: (event: MessageReceivedEvent) => void;
   onChannelMessage?: (event: ChannelMessageEvent) => void;
 }) {
+  const callbacksRef = useRef(callbacks);
   useEffect(() => {
-    const unlistenPromises: Promise<UnlistenFn>[] = [];
+    callbacksRef.current = callbacks;
+  });
 
-    if (callbacks.onPeerConnected) {
-      unlistenPromises.push(
-        listen<PeerConnectedEvent>('peer-connected', (event) => {
-          callbacks.onPeerConnected?.(event.payload);
-        })
-      );
-    }
-
-    if (callbacks.onPeerDisconnected) {
-      unlistenPromises.push(
-        listen<PeerConnectedEvent>('peer-disconnected', (event) => {
-          callbacks.onPeerDisconnected?.(event.payload);
-        })
-      );
-    }
-
-    if (callbacks.onMessageReceived) {
-      unlistenPromises.push(
-        listen<MessageReceivedEvent>('message-received', (event) => {
-          callbacks.onMessageReceived?.(event.payload);
-        })
-      );
-    }
-
-    if (callbacks.onChannelMessage) {
-      unlistenPromises.push(
-        listen<ChannelMessageEvent>('channel-message', (event) => {
-          callbacks.onChannelMessage?.(event.payload);
-        })
-      );
-    }
+  useEffect(() => {
+    const unlistenPromises: Promise<UnlistenFn>[] = [
+      listen<PeerConnectedEvent>('peer-connected', (event) => {
+        callbacksRef.current.onPeerConnected?.(event.payload);
+      }),
+      listen<PeerConnectedEvent>('peer-disconnected', (event) => {
+        callbacksRef.current.onPeerDisconnected?.(event.payload);
+      }),
+      listen<MessageReceivedEvent>('message-received', (event) => {
+        callbacksRef.current.onMessageReceived?.(event.payload);
+      }),
+      listen<ChannelMessageEvent>('channel-message', (event) => {
+        callbacksRef.current.onChannelMessage?.(event.payload);
+      }),
+    ];
 
     return () => {
       Promise.all(unlistenPromises).then((unlisteners) => {
-        unlisteners.forEach((unlisten) => unlisten());
+        unlisteners.forEach((u) => u());
       });
     };
-  }, [callbacks]);
+  }, []); // subscribe once on mount
 }

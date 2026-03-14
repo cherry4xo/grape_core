@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{App, Manager, Emitter};
 use tokio::sync::Mutex;
-use videocalls::{identity, network, storage, tauri_commands::*};
+use videocalls::{identity, network, storage};
 
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -14,7 +14,23 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| ".videocalls/identity.key".to_string());
     let identity_path = PathBuf::from(identity_path);
 
-    let identity = identity::Identity::load_or_generate(&identity_path)?;
+    let seed_path = {
+        let base = std::env::var("VIDEOCALLS_STORAGE_PATH")
+            .unwrap_or_else(|_| ".videocalls".to_string());
+        std::path::PathBuf::from(base).join("seed.enc")
+    };
+
+    let identity = if seed_path.exists() {
+        match videocalls::auth::AuthManager::load(&seed_path, None) {
+            Ok(auth) => match auth.derive_keypair() {
+                Ok(keypair) => identity::Identity::from_keypair(keypair),
+                Err(_) => identity::Identity::load_or_generate(&identity_path)?,
+            },
+            Err(_) => identity::Identity::load_or_generate(&identity_path)?,
+        }
+    } else {
+        identity::Identity::load_or_generate(&identity_path)?
+    };
     let peer_id = identity.peer_id().to_string();
     tracing::info!("PeerId: {}", peer_id);
 
