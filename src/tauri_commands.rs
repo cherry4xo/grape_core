@@ -1,3 +1,4 @@
+use crate::auth::AuthManager;
 use crate::network::{NetworkCommand, NetworkEvent};
 use crate::storage::{Storage, Contact};
 use libp2p::{Multiaddr, PeerId};
@@ -205,6 +206,47 @@ pub async fn list_channels(
         .map_err(|e| format!("Failed to send command: {:?}", e))?;
 
     Ok(())
+}
+
+fn seed_path() -> std::path::PathBuf {
+    let base = std::env::var("VIDEOCALLS_STORAGE_PATH")
+        .unwrap_or_else(|_| ".videocalls".to_string());
+    std::path::PathBuf::from(base).join("seed.enc")
+}
+
+#[tauri::command]
+pub async fn auth_has_seed() -> Result<bool, String> {
+    Ok(seed_path().exists())
+}
+
+#[tauri::command]
+pub async fn auth_generate_mnemonic() -> Result<String, String> {
+    let mut auth = AuthManager::new();
+    auth.generate_mnemonic()
+        .map_err(|e| format!("Failed to generate mnemonic: {}", e))
+}
+
+#[tauri::command]
+pub async fn auth_validate_mnemonic(words: String) -> Result<bool, String> {
+    Ok(AuthManager::validate_mnemonic(&words))
+}
+
+#[tauri::command]
+pub async fn auth_save_seed(words: String, password: Option<String>) -> Result<(), String> {
+    let mut auth = AuthManager::new();
+    auth.import_mnemonic(&words)
+        .map_err(|e| format!("Invalid mnemonic: {}", e))?;
+    auth.save(seed_path(), password.as_deref())
+        .map_err(|e| format!("Failed to save seed: {}", e))
+}
+
+#[tauri::command]
+pub async fn auth_load_seed(password: Option<String>) -> Result<String, String> {
+    let auth = AuthManager::load(seed_path(), password.as_deref())
+        .map_err(|e| format!("Failed to load seed: {}", e))?;
+    let keypair = auth.derive_keypair()
+        .map_err(|e| format!("Failed to derive keypair: {}", e))?;
+    Ok(keypair.public().to_peer_id().to_string())
 }
 
 #[tauri::command]

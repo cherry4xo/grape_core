@@ -1,12 +1,16 @@
 import { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useNetworkEvents } from './hooks/useNetworkEvents';
 import { ContactList } from './components/ContactList';
 import { ChatArea } from './components/ChatArea';
+import { AuthScreen } from './components/AuthScreen';
 import { api } from './api';
 import type { Contact } from './types';
 import './styles/index.css';
 
 function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
   const [peerId, setPeerId] = useState<string>('');
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
   const [showAddContactModal, setShowAddContactModal] = useState(false);
@@ -15,8 +19,32 @@ function App() {
   const [contactsRefreshTrigger, setContactsRefreshTrigger] = useState(0);
 
   useEffect(() => {
-    loadPeerId();
+    checkAuth();
   }, []);
+
+  async function checkAuth() {
+    try {
+      const hasSeed = await invoke<boolean>('auth_has_seed');
+      if (hasSeed) {
+        try {
+          await invoke('auth_load_seed', { password: null });
+          setIsAuthenticated(true);
+        } catch {
+          // Needs password — AuthScreen will handle
+        }
+      }
+    } catch (e) {
+      console.error('Auth check failed:', e);
+    } finally {
+      setAuthChecked(true);
+    }
+  }
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      loadPeerId();
+    }
+  }, [isAuthenticated]);
 
   // Real-time event listeners
   useNetworkEvents({
@@ -59,6 +87,18 @@ function App() {
       console.error('Failed to add contact:', error);
       alert('Failed to add contact: ' + error);
     }
+  }
+
+  if (!authChecked) {
+    return (
+      <div className="auth-screen">
+        <div className="auth-card"><p>Loading...</p></div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <AuthScreen onAuthenticated={() => setIsAuthenticated(true)} />;
   }
 
   return (

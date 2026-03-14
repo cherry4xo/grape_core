@@ -21,6 +21,11 @@ pub fn run() {
             commands::list_channels,
             commands::get_dht_stats,
             commands::trigger_bootstrap,
+            commands::auth_has_seed,
+            commands::auth_generate_mnemonic,
+            commands::auth_validate_mnemonic,
+            commands::auth_save_seed,
+            commands::auth_load_seed,
         ])
         .setup(|app| {
             commands::setup(app)?;
