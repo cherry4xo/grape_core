@@ -11,6 +11,7 @@ pub fn run() {
             commands::get_contacts,
             commands::add_contact,
             commands::remove_contact,
+            commands::rename_contact,
             commands::get_messages,
             commands::send_message,
             commands::dial_peer,
@@ -21,11 +22,14 @@ pub fn run() {
             commands::list_channels,
             commands::get_dht_stats,
             commands::trigger_bootstrap,
+            commands::find_peer,
             commands::auth_has_seed,
+            commands::auth_is_encrypted,
             commands::auth_generate_mnemonic,
             commands::auth_validate_mnemonic,
             commands::auth_save_seed,
             commands::auth_load_seed,
+            commands::auth_unlock,
         ])
         .setup(|app| {
             commands::setup(app)?;

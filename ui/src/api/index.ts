@@ -20,6 +20,10 @@ export const api = {
     return invoke('remove_contact', { peerId });
   },
 
+  async renameContact(peerId: string, name: string | null): Promise<void> {
+    return invoke('rename_contact', { peerId, name });
+  },
+
   // Messages
   async getMessages(chatId: string, limit?: number): Promise<Message[]> {
     return invoke('get_messages', { chatId, limit });
@@ -62,5 +66,9 @@ export const api = {
 
   async triggerBootstrap(): Promise<void> {
     return invoke('trigger_bootstrap');
+  },
+
+  async findPeer(peerId: string): Promise<void> {
+    return invoke('find_peer', { peerId });
   },
 };

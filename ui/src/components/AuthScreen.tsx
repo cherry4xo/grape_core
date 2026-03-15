@@ -3,12 +3,13 @@ import { invoke } from '@tauri-apps/api/core';
 
 interface AuthScreenProps {
   onAuthenticated: () => void;
+  initialStep?: 'welcome' | 'unlock';
 }
 
-type Step = 'welcome' | 'create-show' | 'import';
+type Step = 'welcome' | 'create-show' | 'import' | 'unlock';
 
-export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
-  const [step, setStep] = useState<Step>('welcome');
+export function AuthScreen({ onAuthenticated, initialStep }: AuthScreenProps) {
+  const [step, setStep] = useState<Step>(initialStep ?? 'welcome');
   const [mnemonic, setMnemonic] = useState('');
   const [importWords, setImportWords] = useState('');
   const [password, setPassword] = useState('');
@@ -16,6 +17,19 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const handleUnlock = async () => {
+    if (!password.trim()) { setError('Please enter your password'); return; }
+    setLoading(true); setError('');
+    try {
+      await invoke<string>('auth_unlock', { password });
+      onAuthenticated();
+    } catch {
+      setError('Wrong password. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleGenerate = async () => {
     setLoading(true);
@@ -188,6 +202,30 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
               Back
             </button>
           </div>
+          {error && <p className="auth-error">{error}</p>}
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 'unlock') {
+    return (
+      <div className="auth-screen">
+        <div className="auth-card">
+          <h1>VideoCalls</h1>
+          <p className="auth-subtitle">Enter your password to unlock</p>
+          <input
+            type="password"
+            placeholder="Enter password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
+            className="auth-input"
+            autoFocus
+          />
+          <button onClick={handleUnlock} disabled={loading}>
+            {loading ? 'Unlocking...' : 'Unlock'}
+          </button>
           {error && <p className="auth-error">{error}</p>}
         </div>
       </div>
