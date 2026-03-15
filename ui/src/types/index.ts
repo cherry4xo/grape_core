@@ -2,6 +2,7 @@ export interface Contact {
   peer_id: string;
   name: string | null;
   last_seen: number | null;
+  is_manual: boolean;
 }
 
 export interface Message {
@@ -11,6 +12,7 @@ export interface Message {
   content: string;
   timestamp: number;
   is_outgoing: boolean;
+  delivery_status: 'sent' | 'delivered' | 'queued';
 }
 
 export interface PeerInfo {

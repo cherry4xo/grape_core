@@ -41,6 +41,7 @@ pub enum NetworkEvent {
     MessageReceived { peer_id: PeerId, message: String },
     ChannelMessage { topic: String, peer_id: PeerId, message: String},
     ListenAddrAdded { address: Multiaddr },
+    MessageDelivered { peer_id: PeerId, message_id: String },
 }
 
 pub struct P2PNetwork {
@@ -48,7 +49,7 @@ pub struct P2PNetwork {
     command_rx: mpsc::Receiver<NetworkCommand>,
     command_tx: mpsc::Sender<NetworkCommand>,
     event_tx: broadcast::Sender<NetworkEvent>,
-    pending_requests: HashMap<OutboundRequestId, PeerId>,
+    pending_requests: HashMap<OutboundRequestId, (PeerId, Option<String>)>,
     encryption: MessageEncryption,
     storage: Arc<Storage>,
     local_peer_id: PeerId,
@@ -110,6 +111,9 @@ impl P2PNetwork {
 
         info!("🌐 Network started");
 
+        let bootstrap_peers: std::collections::HashSet<PeerId> =
+            bootstrap::get_bootstrap_nodes().into_iter().map(|n| n.peer_id).collect();
+
         let mut keys_exchanged: HashMap<PeerId, bool> = HashMap::new();
 
         loop {
@@ -133,53 +137,43 @@ impl P2PNetwork {
                         NetworkCommand::SendMessage { peer_id, message } => {
                             info!("📤 Sending message to {}: {}", peer_id, message);
 
+                            let msg_id = uuid::Uuid::new_v4().to_string();
+                            let is_connected = self.swarm.is_connected(&peer_id);
+                            let status = if is_connected { "sent" } else { "queued" };
+
                             let stored_msg = StoredMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
+                                id: msg_id.clone(),
                                 chat_id: peer_id.to_string(),
                                 sender: self.local_peer_id.to_string(),
                                 content: message.clone(),
                                 timestamp: chrono::Utc::now().timestamp(),
                                 is_outgoing: true,
+                                delivery_status: status.to_string(),
                             };
-
                             if let Err(e) = self.storage.save_message(&stored_msg) {
-                                warn!("❌ Failed to save outgoing message: {:?}", e);
+                                warn!("Failed to save message: {:?}", e);
                             }
 
-                            if keys_exchanged.get(&peer_id).copied().unwrap_or(false) {
+                            if !is_connected {
+                                if let Err(e) = self.storage.save_pending_message(&peer_id.to_string(), &message, &msg_id) {
+                                    warn!("Failed to queue offline message: {:?}", e);
+                                }
+                                info!("📬 Queued message for offline peer {}", peer_id);
+                                // skip send
+                            } else if keys_exchanged.get(&peer_id).copied().unwrap_or(false) {
                                 match self.encryption.encrypt(&peer_id, message.as_bytes()) {
                                     Ok(ciphertext) => {
-                                        let msg = Message::EncryptedText {
-                                            ciphertext,
-                                            timestamp: chrono::Utc::now().timestamp(),
-                                        };
-
-                                        info!("🔒 Sending encrypted message to {}", peer_id);
-                                        let request_id = self.swarm
-                                            .behaviour_mut()
-                                            .request_response
-                                            .send_request(&peer_id, msg);
-
-                                        self.pending_requests.insert(request_id, peer_id);
+                                        let msg = Message::EncryptedText { ciphertext, timestamp: chrono::Utc::now().timestamp() };
+                                        let request_id = self.swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
+                                        self.pending_requests.insert(request_id, (peer_id, Some(msg_id)));
                                     }
-                                    Err(e) => {
-                                        warn!("❌ Encryption failed: {:?}", e);
-                                    }
+                                    Err(e) => warn!("Encryption failed: {:?}", e),
                                 }
                             } else {
                                 warn!("⚠️ Key exchange not completed, sending unencrypted");
-
-                                let msg = Message::Text {
-                                    context: message,
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                };
-
-                                let request_id = self.swarm
-                                    .behaviour_mut()
-                                    .request_response
-                                    .send_request(&peer_id, msg);
-
-                                self.pending_requests.insert(request_id, peer_id);
+                                let msg = Message::Text { context: message, timestamp: chrono::Utc::now().timestamp() };
+                                let request_id = self.swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
+                                self.pending_requests.insert(request_id, (peer_id, Some(msg_id)));
                             }
                         }
                         NetworkCommand::SubscribeChannel { topic } => {
@@ -296,12 +290,15 @@ impl P2PNetwork {
 
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, ..} => {
                             info!("✅ Connected to {} at {}", peer_id, endpoint.get_remote_address());
-                            let _ = self.event_tx.send(NetworkEvent::PeerConnected { peer_id });
 
-                            if let Err(e) = self.storage.update_last_seen(&peer_id, chrono::Utc::now().timestamp()) {
-                                warn!("❌ Failed to save contact: {:?}", e);
-                            } else {
-                                info!("💾 Contact saved: {}", peer_id);
+                            if !bootstrap_peers.contains(&peer_id) {
+                                let _ = self.event_tx.send(NetworkEvent::PeerConnected { peer_id });
+                                if let Err(e) = self.storage.save_seen_peer(&peer_id, chrono::Utc::now().timestamp()) {
+                                    warn!("❌ Failed to save seen peer: {:?}", e);
+                                }
+                                if let Err(e) = self.storage.mark_peer_messages_delivered(&peer_id.to_string()) {
+                                    warn!("❌ Failed to mark messages delivered: {:?}", e);
+                                }
                             }
 
                             if !keys_exchanged.contains_key(&peer_id) {
@@ -317,7 +314,23 @@ impl P2PNetwork {
                                     .request_response
                                     .send_request(&peer_id, key_exchange_msg);
 
-                                self.pending_requests.insert(request_id, peer_id);
+                                self.pending_requests.insert(request_id, (peer_id, None));
+                            }
+
+                            let pending = self.storage.get_pending_messages(&peer_id.to_string()).unwrap_or_default();
+                            for (msg_id, content) in pending {
+                                let msg = if keys_exchanged.get(&peer_id).copied().unwrap_or(false) {
+                                    match self.encryption.encrypt(&peer_id, content.as_bytes()) {
+                                        Ok(ciphertext) => Message::EncryptedText { ciphertext, timestamp: chrono::Utc::now().timestamp() },
+                                        Err(_) => Message::Text { context: content.clone(), timestamp: chrono::Utc::now().timestamp() },
+                                    }
+                                } else {
+                                    Message::Text { context: content.clone(), timestamp: chrono::Utc::now().timestamp() }
+                                };
+                                let request_id = self.swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
+                                self.pending_requests.insert(request_id, (peer_id, Some(msg_id.clone())));
+                                let _ = self.storage.delete_pending_message(&peer_id.to_string(), &msg_id);
+                                let _ = self.storage.update_message_status(&msg_id, "sent");
                             }
                         }
 
@@ -383,6 +396,7 @@ impl P2PNetwork {
                                                 content: context.clone(),
                                                 timestamp: *timestamp,
                                                 is_outgoing: false,
+                                                delivery_status: "delivered".to_string(),
                                             };
 
                                             if let Err(e) = self.storage.save_message(&stored_msg) {
@@ -416,6 +430,7 @@ impl P2PNetwork {
                                                         content: message.clone(),
                                                         timestamp: *timestamp,
                                                         is_outgoing: false,
+                                                        delivery_status: "delivered".to_string(),
                                                     };
 
                                                     if let Err(e) = self.storage.save_message(&stored_msg) {
@@ -449,7 +464,8 @@ impl P2PNetwork {
                                     }    
                                 }
 
-                                request_response::Message::Response { response, .. } => {
+                                request_response::Message::Response { request_id, response, .. } => {
+                                    let pending = self.pending_requests.remove(&request_id);
                                     match response {
                                         Message::KeyExchange { public_key } => {
                                             info!("🔑 Received public key response from {}", peer);
@@ -459,6 +475,15 @@ impl P2PNetwork {
                                             } else {
                                                 info!("✅ Key exchange completed with {}", peer);
                                                 keys_exchanged.insert(peer, true);
+                                            }
+                                        }
+                                        Message::Pong => {
+                                            if let Some((_, Some(msg_id))) = pending {
+                                                let _ = self.storage.update_message_status(&msg_id, "delivered");
+                                                let _ = self.event_tx.send(NetworkEvent::MessageDelivered {
+                                                    peer_id: peer,
+                                                    message_id: msg_id,
+                                                });
                                             }
                                         }
                                         _ => {

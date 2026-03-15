@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useNetworkEvents } from './hooks/useNetworkEvents';
 import { ContactList } from './components/ContactList';
 import { ChatArea } from './components/ChatArea';
@@ -17,6 +18,7 @@ function App() {
   const [newContactPeerId, setNewContactPeerId] = useState('');
   const [newContactName, setNewContactName] = useState('');
   const [contactsRefreshTrigger, setContactsRefreshTrigger] = useState(0);
+  const [needsPassword, setNeedsPassword] = useState(false);
 
   useEffect(() => {
     checkAuth();
@@ -25,25 +27,32 @@ function App() {
   async function checkAuth() {
     try {
       const hasSeed = await invoke<boolean>('auth_has_seed');
-      if (hasSeed) {
-        try {
-          await invoke('auth_load_seed', { password: null });
-          setIsAuthenticated(true);
-        } catch {
-          // Needs password — AuthScreen will handle
-        }
+      if (!hasSeed) {
+        setAuthChecked(true);
+        return;
+      }
+      const isEncrypted = await invoke<boolean>('auth_is_encrypted');
+      if (isEncrypted) {
+        setNeedsPassword(true);
+        setAuthChecked(true);
+      } else {
+        await invoke('auth_load_seed', { password: null });
+        setIsAuthenticated(true);
+        setAuthChecked(true);
       }
     } catch (e) {
       console.error('Auth check failed:', e);
-    } finally {
       setAuthChecked(true);
     }
   }
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (!isAuthenticated) return;
+    loadPeerId();
+    const unlistenPromise = listen('listen-addr-added', () => {
       loadPeerId();
-    }
+    });
+    return () => { unlistenPromise.then((fn: () => void) => fn()); };
   }, [isAuthenticated]);
 
   // Real-time event listeners
@@ -59,12 +68,16 @@ function App() {
   });
 
   async function loadPeerId() {
-    try {
-      const id = await api.getPeerId();
-      setPeerId(id);
-    } catch (error) {
-      console.error('Failed to get peer ID:', error);
+    for (let i = 0; i < 20; i++) {
+      try {
+        const id = await api.getPeerId();
+        setPeerId(id);
+        return;
+      } catch {
+        await new Promise(r => setTimeout(r, 500));
+      }
     }
+    console.error('Failed to get peer ID after retries');
   }
 
   async function handleAddContact(e: React.FormEvent) {
@@ -98,7 +111,12 @@ function App() {
   }
 
   if (!isAuthenticated) {
-    return <AuthScreen onAuthenticated={() => setIsAuthenticated(true)} />;
+    return (
+      <AuthScreen
+        onAuthenticated={() => setIsAuthenticated(true)}
+        initialStep={needsPassword ? 'unlock' : 'welcome'}
+      />
+    );
   }
 
   return (

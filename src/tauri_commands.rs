@@ -2,10 +2,15 @@ use crate::auth::AuthManager;
 use crate::network::{NetworkCommand, NetworkEvent};
 use crate::storage::{Storage, Contact};
 use libp2p::{Multiaddr, PeerId};
+pub use libp2p::identity::Keypair as LibP2pKeypair;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
+
+pub struct PendingAuth {
+    pub unlock_tx: Arc<Mutex<Option<oneshot::Sender<libp2p::identity::Keypair>>>>,
+}
 
 // App state that will be shared across Tauri commands
 pub struct AppState {
@@ -21,6 +26,7 @@ pub struct ContactDto {
     pub peer_id: String,
     pub name: Option<String>,
     pub last_seen: Option<i64>,
+    pub is_manual: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +37,7 @@ pub struct MessageDto {
     pub content: String,
     pub timestamp: i64,
     pub is_outgoing: bool,
+    pub delivery_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +62,7 @@ pub async fn get_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>,
         peer_id: c.peer_id,
         name: c.name,
         last_seen: c.last_seen,
+        is_manual: c.is_manual,
     }).collect())
 }
 
@@ -68,10 +76,34 @@ pub async fn add_contact(
         peer_id,
         name,
         last_seen: Some(chrono::Utc::now().timestamp()),
+        is_manual: true,
     };
 
     state.storage.save_contact(&contact)
         .map_err(|e| format!("Failed to save contact: {:?}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rename_contact(
+    peer_id: String,
+    name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let contacts_tree = state.storage.db_tree("contacts")
+        .map_err(|e| format!("Failed to open contacts: {:?}", e))?;
+
+    if let Some(value) = contacts_tree.get(peer_id.as_bytes())
+        .map_err(|e| format!("DB error: {:?}", e))?
+    {
+        let mut contact: crate::storage::Contact = bincode::deserialize(&value)
+            .map_err(|e| format!("Deserialize error: {:?}", e))?;
+        contact.name = name;
+        contacts_tree.insert(peer_id.as_bytes(), bincode::serialize(&contact)
+            .map_err(|e| format!("Serialize error: {:?}", e))?)
+            .map_err(|e| format!("DB insert error: {:?}", e))?;
+    }
 
     Ok(())
 }
@@ -108,6 +140,7 @@ pub async fn get_messages(
         content: m.content,
         timestamp: m.timestamp,
         is_outgoing: m.is_outgoing,
+        delivery_status: m.delivery_status,
     }).collect())
 }
 
@@ -161,6 +194,7 @@ pub async fn search_messages(
         content: m.content,
         timestamp: m.timestamp,
         is_outgoing: m.is_outgoing,
+        delivery_status: m.delivery_status,
     }).collect())
 }
 
@@ -220,6 +254,14 @@ pub async fn auth_has_seed() -> Result<bool, String> {
 }
 
 #[tauri::command]
+pub async fn auth_is_encrypted() -> Result<bool, String> {
+    let path = seed_path();
+    if !path.exists() { return Ok(false); }
+    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(serde_json::from_slice::<crate::auth::EncryptedSeed>(&data).is_ok())
+}
+
+#[tauri::command]
 pub async fn auth_generate_mnemonic() -> Result<String, String> {
     let mut auth = AuthManager::new();
     auth.generate_mnemonic()
@@ -267,4 +309,36 @@ pub async fn trigger_bootstrap(
         .map_err(|e| format!("Failed to send command: {:?}", e))?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn find_peer(
+    peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let peer_id = peer_id.parse::<PeerId>()
+        .map_err(|e| format!("Invalid peer_id: {:?}", e))?;
+
+    state.command_tx.send(NetworkCommand::FindPeer { peer_id }).await
+        .map_err(|e| format!("Failed to send command: {:?}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn auth_unlock(
+    password: String,
+    state: State<'_, PendingAuth>,
+) -> Result<String, String> {
+    let auth = AuthManager::load(seed_path(), Some(&password))
+        .map_err(|e| format!("Wrong password: {}", e))?;
+    let keypair = auth.derive_keypair()
+        .map_err(|e| format!("Key derivation failed: {}", e))?;
+    let peer_id = keypair.public().to_peer_id().to_string();
+    let mut guard = state.unlock_tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(keypair);
+    }
+
+    Ok(peer_id)
 }

@@ -72,8 +72,10 @@ impl CLI {
         println!("  dial <multiaddr>               - Connect to peer");
         println!("  history <peer_id|name> [limit] - View chat history (default 20)");
         println!("  search <query> [limit]         - Search messages (default 50)");
-        println!("  contacts                       - List all contacts");
+        println!("  contacts                       - List manual contacts");
+  println!("  strangers                      - List seen peers (not in contacts)");
         println!("  contact add <peer_id|name> [new_name]  - Add/update contact");
+        println!("  contact rename <peer_id|name> <new_name> - Rename contact");
         println!("  contact remove <peer_id|name>  - Remove contact");
         println!("  channel subscribe <topic>      - Subscribe to channel");
         println!("  channel unsubscribe <topic>    - Unsubscribe from channel");
@@ -135,8 +137,10 @@ impl CLI {
                 println!("  dial <multiaddr>               - Connect to peer");
                 println!("  history <peer_id|name> [limit] - View chat history (default 20)");
                 println!("  search <query> [limit]         - Search messages (default 50)");
-                println!("  contacts                       - List all contacts");
+                println!("  contacts                       - List manual contacts");
+  println!("  strangers                      - List seen peers (not in contacts)");
                 println!("  contact add <peer_id|name> [new_name]  - Add/update contact");
+                println!("  contact rename <peer_id|name> <new_name> - Rename contact");
                 println!("  contact remove <peer_id|name>  - Remove contact");
                 println!("  channel subscribe <topic>      - Subscribe to channel");
                 println!("  channel unsubscribe <topic>    - Unsubscribe from channel");
@@ -286,16 +290,25 @@ impl CLI {
                                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                                     .unwrap_or_else(|| "Unknown".to_string());
 
+                                let status_icon = if msg.is_outgoing {
+                                    match msg.delivery_status.as_str() {
+                                        "queued" => " ⏳",
+                                        "sent" => " ✓",
+                                        "delivered" => " ✓✓",
+                                        _ => "",
+                                    }
+                                } else {
+                                    ""
+                                };
                                 let direction = if msg.is_outgoing { "→" } else { "←" };
 
-                                // Форматировать sender с именем
                                 let sender_display = if let Ok(sender_peer) = msg.sender.parse::<PeerId>() {
                                     self.format_peer(&sender_peer)
                                 } else {
                                     msg.sender.clone()
                                 };
 
-                                println!("[{}] {} {}: {}", timestamp, direction, sender_display, msg.content);
+                                println!("[{}] {} {}: {}{}", timestamp, direction, sender_display, msg.content, status_icon);
                             }
 
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -310,28 +323,47 @@ impl CLI {
             "contacts" => {
                 match self.storage.get_contacts() {
                     Ok(contacts) => {
-                        if contacts.is_empty() {
+                        let manual: Vec<_> = contacts.iter().filter(|c| c.is_manual).collect();
+                        if manual.is_empty() {
                             println!("\n📭 No contacts found\n");
                         } else {
-                            println!("\n👥 Contacts ({}):", contacts.len());
+                            println!("\n👥 Contacts ({}):", manual.len());
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-                            for contact in contacts {
+                            for contact in manual {
                                 let name = contact.name.as_deref().unwrap_or("Unknown");
                                 let last_seen = contact.last_seen
                                     .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
                                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                                     .unwrap_or_else(|| "Never".to_string());
-
                                 println!("  {} | {} | Last seen: {}", contact.peer_id, name, last_seen);
                             }
-
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
                         }
                     }
-                    Err(e) => {
-                        println!("❌ Failed to get contacts: {:?}", e);
+                    Err(e) => println!("❌ Failed to get contacts: {:?}", e),
+                }
+            }
+
+            "strangers" => {
+                match self.storage.get_contacts() {
+                    Ok(contacts) => {
+                        let strangers: Vec<_> = contacts.iter().filter(|c| !c.is_manual).collect();
+                        if strangers.is_empty() {
+                            println!("\n📭 No strangers seen yet\n");
+                        } else {
+                            println!("\n👤 Strangers ({}):", strangers.len());
+                            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                            for contact in strangers {
+                                let last_seen = contact.last_seen
+                                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                    .unwrap_or_else(|| "Never".to_string());
+                                println!("  {} | Last seen: {}", contact.peer_id, last_seen);
+                            }
+                            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                        }
                     }
+                    Err(e) => println!("❌ Failed to get strangers: {:?}", e),
                 }
             }
 
@@ -362,6 +394,7 @@ impl CLI {
                             peer_id: peer_id.to_string(),
                             name,
                             last_seen: Some(chrono::Utc::now().timestamp()),
+                            is_manual: true,
                         };
 
                         match self.storage.save_contact(&contact) {
@@ -372,6 +405,27 @@ impl CLI {
                             Err(e) => {
                                 println!("❌ Failed to save contact: {:?}", e);
                             }
+                        }
+                    }
+                    "rename" => {
+                        if parts.len() < 4 {
+                            println!("Usage: contact rename <peer_id|name> <new_name>");
+                            return Ok(());
+                        }
+
+                        let peer_id = self.resolve_peer(parts[2])?;
+                        let new_name = parts[3..].join(" ");
+
+                        match self.storage.get_contact(&peer_id) {
+                            Ok(Some(mut contact)) => {
+                                contact.name = Some(new_name.clone());
+                                match self.storage.save_contact(&contact) {
+                                    Ok(_) => println!("✅ Contact renamed to: {}", new_name),
+                                    Err(e) => println!("❌ Failed to rename contact: {:?}", e),
+                                }
+                            }
+                            Ok(None) => println!("❌ Contact not found: {}", parts[2]),
+                            Err(e) => println!("❌ Failed to get contact: {:?}", e),
                         }
                     }
                     "remove" => {
@@ -513,6 +567,10 @@ impl CLI {
             NetworkEvent::ChannelMessage { topic, peer_id, message } => {
                 let peer_display = self.format_peer(&peer_id);
                 println!("\n📢 Channel [{}] from {}: {}\n", topic, peer_display, message);
+            }
+            NetworkEvent::MessageDelivered { peer_id, message_id: _ } => {
+                let peer_display = self.format_peer(&peer_id);
+                println!("\n✓✓ Message delivered to {}\n", peer_display);
             }
         }
     }

@@ -12,6 +12,7 @@ pub struct StoredMessage {
     pub content: String,
     pub timestamp: i64,
     pub is_outgoing: bool,
+    pub delivery_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,7 @@ pub struct Contact {
     pub peer_id: String,
     pub name: Option<String>,
     pub last_seen: Option<i64>,
+    pub is_manual: bool,
 }
 
 pub struct Storage {
@@ -31,6 +33,10 @@ impl Storage {
             .context("Failed to open database")?;
 
         Ok(Self { db })
+    }
+
+    pub fn db_tree(&self, name: &str) -> Result<sled::Tree> {
+        Ok(self.db.open_tree(name)?)
     }
 
     pub fn save_message(&self, message: &StoredMessage) -> Result<()> {
@@ -70,6 +76,71 @@ impl Storage {
 
         messages.reverse();
         Ok(messages)
+    }
+
+    pub fn mark_peer_messages_delivered(&self, peer_id: &str) -> Result<()> {
+        let tree = self.db.open_tree("messages")?;
+        for item in tree.iter() {
+            let (key, value) = item?;
+            let mut msg: StoredMessage = bincode::deserialize(&value)?;
+            if msg.is_outgoing
+                && msg.chat_id == peer_id
+                && msg.delivery_status == "sent"
+            {
+                msg.delivery_status = "delivered".to_string();
+                tree.insert(key, bincode::serialize(&msg)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn update_message_status(&self, message_id: &str, status: &str) -> Result<()> {
+        let tree = self.db.open_tree("messages")?;
+        for item in tree.iter() {
+            let (key, value) = item?;
+            let mut msg: StoredMessage = bincode::deserialize(&value)?;
+            if msg.id == message_id {
+                msg.delivery_status = status.to_string();
+                tree.insert(key, bincode::serialize(&msg)?)?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_pending_message(&self, peer_id: &str, content: &str, message_id: &str) -> Result<()> {
+        let tree = self.db.open_tree("pending_messages")?;
+        let key = format!("{}_{}", peer_id, message_id);
+        let value = serde_json::json!({
+            "peer_id": peer_id,
+            "content": content,
+            "message_id": message_id
+        }).to_string();
+        tree.insert(key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_pending_messages(&self, peer_id: &str) -> Result<Vec<(String, String)>> {
+        let tree = self.db.open_tree("pending_messages")?;
+        let prefix = format!("{}_", peer_id);
+        let mut result = Vec::new();
+        for item in tree.iter() {
+            let (key, value) = item?;
+            if String::from_utf8_lossy(&key).starts_with(&prefix) {
+                let json: serde_json::Value = serde_json::from_slice(&value)?;
+                let msg_id = json["message_id"].as_str().unwrap_or("").to_string();
+                let content = json["content"].as_str().unwrap_or("").to_string();
+                result.push((msg_id, content));
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn delete_pending_message(&self, peer_id: &str, message_id: &str) -> Result<()> {
+        let tree = self.db.open_tree("pending_messages")?;
+        tree.remove(format!("{}_{}", peer_id, message_id))?;
+        Ok(())
     }
 
     pub fn save_contact(&self, contact: &Contact) -> Result<()> {
@@ -153,24 +224,29 @@ impl Storage {
 
     pub fn update_last_seen(&self, peer_id: &PeerId, timestamp: i64) -> Result<()> {
         let contacts_tree = self.db.open_tree("contacts")?;
-
         let key = peer_id.to_string();
+        if let Some(value) = contacts_tree.get(key.as_bytes())? {
+            let mut contact: Contact = bincode::deserialize(&value)?;
+            contact.last_seen = Some(timestamp);
+            contacts_tree.insert(key.as_bytes(), bincode::serialize(&contact)?)?;
+        }
+        Ok(())
+    }
 
-        let mut contact = if let Some(value) = contacts_tree.get(key.as_bytes())? {
-            bincode::deserialize(&value)?
-        } else {
-            Contact {
-                peer_id: peer_id.to_string(),
+    pub fn save_seen_peer(&self, peer_id: &PeerId, timestamp: i64) -> Result<()> {
+        let contacts_tree = self.db.open_tree("contacts")?;
+        let key = peer_id.to_string();
+        if contacts_tree.get(key.as_bytes())?.is_none() {
+            let contact = Contact {
+                peer_id: key.clone(),
                 name: None,
-                last_seen: None,
-            }
-        };
-
-        contact.last_seen = Some(timestamp);
-
-        let value = bincode::serialize(&contact)?;
-        contacts_tree.insert(key.as_bytes(), value)?;
-
+                last_seen: Some(timestamp),
+                is_manual: false,
+            };
+            contacts_tree.insert(key.as_bytes(), bincode::serialize(&contact)?)?;
+        } else {
+            self.update_last_seen(peer_id, timestamp)?;
+        }
         Ok(())
     }
 
@@ -216,6 +292,7 @@ mod tests {
             content: "Hello!".to_string(),
             timestamp: 1234567890,
             is_outgoing: false,
+            delivery_status: "sent".to_string(),
         };
 
         storage.save_message(&message).unwrap();
@@ -239,6 +316,7 @@ mod tests {
             peer_id: "peer123".to_string(),
             name: Some("Alice".to_string()),
             last_seen: Some(1234567890),
+            is_manual: true,
         };
 
         storage.save_contact(&contact).unwrap();

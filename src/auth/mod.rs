@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, SaltString},
     Argon2,
 };
 use bip39::{Language, Mnemonic};
@@ -105,12 +105,20 @@ impl AuthManager {
     fn encrypt_seed(&self, plaintext: &[u8], password: &str) -> Result<EncryptedSeed> {
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
-        let hash = argon2
+        let hash_str = argon2
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| anyhow!("Argon2 error: {}", e))?
             .to_string();
 
-        let key_bytes = &hash.as_bytes()[..32];
+        let parsed = PasswordHash::new(&hash_str)
+            .map_err(|e| anyhow!("Failed to parse hash: {}", e))?;
+        let hash_output = parsed.hash
+            .ok_or_else(|| anyhow!("No hash output in PHC string"))?;
+        let hash_bytes = hash_output.as_bytes();
+        if hash_bytes.len() < 32 {
+            return Err(anyhow!("Hash output too short"));
+        }
+        let key_bytes = &hash_bytes[..32];
 
         let unbound = UnboundKey::new(&AES_256_GCM, key_bytes)
             .map_err(|_| anyhow!("Failed to create AES key"))?;
@@ -137,12 +145,20 @@ impl AuthManager {
         let argon2 = Argon2::default();
         let salt = SaltString::from_b64(&encrypted.salt)
             .map_err(|e| anyhow!("Invalid salt: {}", e))?;
-        let hash = argon2
+        let hash_str = argon2
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| anyhow!("Argon2 error: {}", e))?
             .to_string();
 
-        let key_bytes = &hash.as_bytes()[..32];
+        let parsed = PasswordHash::new(&hash_str)
+            .map_err(|e| anyhow!("Failed to parse hash: {}", e))?;
+        let hash_output = parsed.hash
+            .ok_or_else(|| anyhow!("No hash output in PHC string"))?;
+        let hash_bytes = hash_output.as_bytes();
+        if hash_bytes.len() < 32 {
+            return Err(anyhow!("Hash output too short"));
+        }
+        let key_bytes = &hash_bytes[..32];
 
         let unbound = UnboundKey::new(&AES_256_GCM, key_bytes)
             .map_err(|_| anyhow!("Failed to create AES key"))?;
