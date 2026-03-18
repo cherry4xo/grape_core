@@ -13,6 +13,7 @@ type Tab = 'contacts' | 'strangers';
 
 export function ContactList({ onSelectContact, selectedContact, refreshTrigger }: ContactListProps) {
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [chatPeers, setChatPeers] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<Tab>('contacts');
   const [searchQuery, setSearchQuery] = useState('');
@@ -29,8 +30,12 @@ export function ContactList({ onSelectContact, selectedContact, refreshTrigger }
 
   async function loadContacts() {
     try {
-      const data = await api.getContacts();
-      setContacts(data);
+      const [all, chats] = await Promise.all([
+        api.getContacts().catch(() => [] as Contact[]),
+        api.getChatPeers().catch(() => [] as Contact[]),
+      ]);
+      setContacts(all);
+      setChatPeers(chats);
     } catch (error) {
       console.error('Failed to load contacts:', error);
     } finally {
@@ -96,6 +101,14 @@ export function ContactList({ onSelectContact, selectedContact, refreshTrigger }
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
+  // Reload once network/AppState is ready (in case initial load happened before AppState registered)
+  useEffect(() => {
+    const unlisten = listen('listen-addr-added', () => {
+      loadContacts();
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
   // Track online peers
   useEffect(() => {
     const unlistenConnected = listen<{ peer_id: string }>('peer-connected', (event) => {
@@ -121,7 +134,7 @@ export function ContactList({ onSelectContact, selectedContact, refreshTrigger }
     return peerId;
   }
 
-  const sortContacts = (list: Contact[]) =>
+  const sortByOnlineThenLastSeen = (list: Contact[]) =>
     [...list].sort((a, b) => {
       const aOnline = onlinePeers.has(a.peer_id) ? 1 : 0;
       const bOnline = onlinePeers.has(b.peer_id) ? 1 : 0;
@@ -129,8 +142,16 @@ export function ContactList({ onSelectContact, selectedContact, refreshTrigger }
       return (b.last_seen ?? 0) - (a.last_seen ?? 0);
     });
 
-  const manual = sortContacts(contacts.filter(c => c.is_manual));
-  const strangers = sortContacts(contacts.filter(c => !c.is_manual));
+  const chatPeerIds = new Set(chatPeers.map(c => c.peer_id));
+
+  // Contacts tab: chat history + manually added (even without messages)
+  const manualWithoutChat = contacts.filter(c => c.is_manual && !chatPeerIds.has(c.peer_id));
+  const manual = sortByOnlineThenLastSeen([...chatPeers, ...manualWithoutChat]);
+
+  // Strangers: connected but no messages and not manually added
+  const strangers = sortByOnlineThenLastSeen(
+    contacts.filter(c => !c.is_manual && !chatPeerIds.has(c.peer_id))
+  );
 
   const filterFn = (c: Contact) => {
     if (!searchQuery.trim()) return true;

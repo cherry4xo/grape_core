@@ -38,6 +38,22 @@ pub struct MessageDto {
     pub timestamp: i64,
     pub is_outgoing: bool,
     pub delivery_status: String,
+    pub file_transfer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferDto {
+    pub id: String,
+    pub chat_id: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub total_chunks: u32,
+    pub chunks_done: u32,
+    pub local_path: Option<String>,
+    pub is_outgoing: bool,
+    pub status: String,
+    pub timestamp: i64,
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +67,36 @@ pub struct PeerInfo {
 #[tauri::command]
 pub async fn get_peer_id(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.peer_id.clone())
+}
+
+#[tauri::command]
+pub async fn get_chat_peers(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
+    let chat_peers = state.storage.get_chat_peer_ids()
+        .map_err(|e| format!("Failed to get chat peers: {:?}", e))?;
+
+    let contacts = state.storage.get_contacts()
+        .map_err(|e| format!("Failed to get contacts: {:?}", e))?;
+
+    let contact_map: std::collections::HashMap<String, crate::storage::Contact> =
+        contacts.into_iter().map(|c| (c.peer_id.clone(), c)).collect();
+
+    Ok(chat_peers.into_iter().map(|(peer_id, last_msg_ts)| {
+        if let Some(c) = contact_map.get(&peer_id) {
+            ContactDto {
+                peer_id: c.peer_id.clone(),
+                name: c.name.clone(),
+                last_seen: Some(last_msg_ts),
+                is_manual: c.is_manual,
+            }
+        } else {
+            ContactDto {
+                peer_id: peer_id.clone(),
+                name: None,
+                last_seen: Some(last_msg_ts),
+                is_manual: false,
+            }
+        }
+    }).collect())
 }
 
 #[tauri::command]
@@ -141,6 +187,7 @@ pub async fn get_messages(
         timestamp: m.timestamp,
         is_outgoing: m.is_outgoing,
         delivery_status: m.delivery_status,
+        file_transfer_id: m.file_transfer_id,
     }).collect())
 }
 
@@ -195,6 +242,7 @@ pub async fn search_messages(
         timestamp: m.timestamp,
         is_outgoing: m.is_outgoing,
         delivery_status: m.delivery_status,
+        file_transfer_id: m.file_transfer_id,
     }).collect())
 }
 
@@ -341,4 +389,79 @@ pub async fn auth_unlock(
     }
 
     Ok(peer_id)
+}
+
+#[tauri::command]
+pub async fn send_file(
+    peer_id: String,
+    file_path: String,
+    caption: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let peer_id = peer_id.parse::<PeerId>()
+        .map_err(|e| format!("Invalid peer_id: {:?}", e))?;
+    let path = std::path::PathBuf::from(&file_path);
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+    state.command_tx.send(NetworkCommand::SendFile {
+        peer_id,
+        file_path: path,
+        caption: caption.unwrap_or_default(),
+    }).await
+        .map_err(|e| format!("Failed to send command: {:?}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_file_transfers(
+    chat_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<FileTransferDto>, String> {
+    let transfers = state.storage.get_file_transfers_for_chat(&chat_id)
+        .map_err(|e| format!("Failed to get file transfers: {:?}", e))?;
+    Ok(transfers.into_iter().map(|ft| FileTransferDto {
+        id: ft.id,
+        chat_id: ft.chat_id,
+        file_name: ft.file_name,
+        file_size: ft.file_size,
+        total_chunks: ft.total_chunks,
+        chunks_done: ft.chunks_done,
+        local_path: ft.local_path,
+        is_outgoing: ft.is_outgoing,
+        status: ft.status,
+        timestamp: ft.timestamp,
+        mime_type: ft.mime_type,
+    }).collect())
+}
+
+#[tauri::command]
+pub async fn open_file(file_path: String) -> Result<(), String> {
+    // Use the OS to open the file with the default application
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(&file_path).spawn()
+        .map_err(|e| format!("Failed to open file: {:?}", e))?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("explorer").arg(&file_path).spawn()
+        .map_err(|e| format!("Failed to open file: {:?}", e))?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open").arg(&file_path).spawn()
+        .map_err(|e| format!("Failed to open file: {:?}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_call_signal(
+    peer_id: String,
+    call_id: String,
+    signal_json: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let peer_id = peer_id.parse::<PeerId>()
+        .map_err(|e| format!("Invalid peer_id: {:?}", e))?;
+
+    state.command_tx.send(NetworkCommand::SendCallSignal { peer_id, call_id, signal_json }).await
+        .map_err(|e| format!("Failed to send call command: {:?}", e))?;
+
+    Ok(())
 }

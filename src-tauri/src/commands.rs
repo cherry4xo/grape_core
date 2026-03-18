@@ -114,6 +114,46 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                             "message_id": message_id
                         }));
                     }
+                    network::NetworkEvent::FileReceived { peer_id, transfer_id, message_id, file_name, file_path, size, mime_type, caption } => {
+                        let _ = emitter.emit("file-received", serde_json::json!({
+                            "peer_id": peer_id.to_string(),
+                            "transfer_id": transfer_id,
+                            "message_id": message_id,
+                            "file_name": file_name,
+                            "file_path": file_path,
+                            "size": size,
+                            "mime_type": mime_type,
+                            "caption": caption,
+                        }));
+                    }
+                    network::NetworkEvent::FileTransferProgress { peer_id, transfer_id, chunks_done, total_chunks } => {
+                        let _ = emitter.emit("file-transfer-progress", serde_json::json!({
+                            "peer_id": peer_id.to_string(),
+                            "transfer_id": transfer_id,
+                            "chunks_done": chunks_done,
+                            "total_chunks": total_chunks,
+                        }));
+                    }
+                    network::NetworkEvent::FileTransferFailed { peer_id, transfer_id, reason } => {
+                        let _ = emitter.emit("file-transfer-failed", serde_json::json!({
+                            "peer_id": peer_id.to_string(),
+                            "transfer_id": transfer_id,
+                            "reason": reason,
+                        }));
+                    }
+                    network::NetworkEvent::FileTransferCompleted { peer_id, transfer_id } => {
+                        let _ = emitter.emit("file-transfer-completed", serde_json::json!({
+                            "peer_id": peer_id.to_string(),
+                            "transfer_id": transfer_id,
+                        }));
+                    }
+                    network::NetworkEvent::CallSignalReceived { peer_id, call_id, signal_json } => {
+                        let _ = emitter.emit("call-signal", serde_json::json!({
+                            "peer_id": peer_id.to_string(),
+                            "call_id": call_id,
+                            "signal_json": signal_json,
+                        }));
+                    }
                 }
             }
         });

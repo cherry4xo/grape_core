@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Contact, Message } from '../types';
+import type { Contact, Message, FileTransfer } from '../types';
 
 export const api = {
   // Peer ID
@@ -10,6 +10,10 @@ export const api = {
   // Contacts
   async getContacts(): Promise<Contact[]> {
     return invoke('get_contacts');
+  },
+
+  async getChatPeers(): Promise<Contact[]> {
+    return invoke('get_chat_peers');
   },
 
   async addContact(peerId: string, name?: string): Promise<void> {
@@ -71,4 +75,20 @@ export const api = {
   async findPeer(peerId: string): Promise<void> {
     return invoke('find_peer', { peerId });
   },
+
+  async sendFile(peerId: string, filePath: string, caption: string = ''): Promise<void> {
+    return invoke('send_file', { peerId, filePath, caption });
+  },
+
+  async getFileTransfers(chatId: string): Promise<FileTransfer[]> {
+    return invoke('get_file_transfers', { chatId });
+  },
+
+  async openFile(filePath: string): Promise<void> {
+    return invoke('open_file', { filePath });
+  },
+
+  async sendCallSignal(peerId: string, callId: string, signalJson: string): Promise<void> {
+    return invoke('send_call_signal', { peerId, callId, signalJson });
+  }
 };

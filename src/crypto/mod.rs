@@ -96,6 +96,40 @@ impl MessageEncryption {
         Ok(in_out)
     }
 
+    /// Encrypt a file chunk using chunk_index as nonce (independent of message counter).
+    pub fn encrypt_chunk(&self, peer_id: &PeerId, data: &[u8], chunk_index: u64) -> Result<Vec<u8>> {
+        let shared_secret = self.peer_shared_secrets
+            .get(peer_id)
+            .context("No shared secret for peer")?;
+
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &shared_secret[..32])
+            .map_err(|e| anyhow::anyhow!("Failed to create key: {:?}", e))?;
+
+        let mut sealing_key = SealingKey::new(unbound_key, CounterNonceSequence::new(chunk_index));
+        let mut in_out = data.to_vec();
+        sealing_key
+            .seal_in_place_append_tag(Aad::empty(), &mut in_out)
+            .map_err(|e| anyhow::anyhow!("Chunk encryption failed: {:?}", e))?;
+        Ok(in_out)
+    }
+
+    /// Decrypt a file chunk using chunk_index as nonce (independent of message counter).
+    pub fn decrypt_chunk(&self, peer_id: &PeerId, data: &[u8], chunk_index: u64) -> Result<Vec<u8>> {
+        let shared_secret = self.peer_shared_secrets
+            .get(peer_id)
+            .context("No shared secret for peer")?;
+
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &shared_secret[..32])
+            .map_err(|e| anyhow::anyhow!("Failed to create key: {:?}", e))?;
+
+        let mut opening_key = OpeningKey::new(unbound_key, CounterNonceSequence::new(chunk_index));
+        let mut in_out = data.to_vec();
+        let plaintext = opening_key
+            .open_in_place(Aad::empty(), &mut in_out)
+            .map_err(|e| anyhow::anyhow!("Chunk decryption failed: {:?}", e))?;
+        Ok(plaintext.to_vec())
+    }
+
     pub fn decrypt(&mut self, peer_id: &PeerId, data: &[u8]) -> Result<Vec<u8>> {
         let shared_secret = self.peer_shared_secrets
             .get(peer_id)

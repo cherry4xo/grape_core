@@ -69,6 +69,7 @@ impl CLI {
         println!("Commands:");
         println!("  peers                          - List connected peers");
         println!("  send <peer_id|name> <msg>      - Send message to peer");
+        println!("  sendfile <peer|name> <path>    - Send a file to peer");
         println!("  dial <multiaddr>               - Connect to peer");
         println!("  history <peer_id|name> [limit] - View chat history (default 20)");
         println!("  search <query> [limit]         - Search messages (default 50)");
@@ -134,6 +135,7 @@ impl CLI {
                 println!("\nAvailable commands:");
                 println!("  peers                          - List connected peers");
                 println!("  send <peer_id|name> <msg>      - Send message to peer");
+                println!("  sendfile <peer|name> <path>    - Send a file to peer");
                 println!("  dial <multiaddr>               - Connect to peer");
                 println!("  history <peer_id|name> [limit] - View chat history (default 20)");
                 println!("  search <query> [limit]         - Search messages (default 50)");
@@ -535,6 +537,23 @@ impl CLI {
                     .send(NetworkCommand::GetNatStatus)
                     .await?;
             }
+            "sendfile" => {
+                if parts.len() < 3 {
+                    println!("Usage: sendfile <peer_id|name> <path> [caption]");
+                    return Ok(());
+                }
+                let peer_id = self.resolve_peer(parts[1])?;
+                let file_path = std::path::PathBuf::from(parts[2]);
+                if !file_path.exists() {
+                    println!("❌ File not found: {}", parts[2]);
+                    return Ok(());
+                }
+                let caption = if parts.len() > 3 { parts[3..].join(" ") } else { String::new() };
+                println!("📤 Sending file: {}", parts[2]);
+                self.command_tx
+                    .send(NetworkCommand::SendFile { peer_id, file_path, caption })
+                    .await?;
+            }
             _ => {
                 println!("Unknown command: {}. Type 'help' for available commands.", parts[0]);
             }
@@ -571,6 +590,34 @@ impl CLI {
             NetworkEvent::MessageDelivered { peer_id, message_id: _ } => {
                 let peer_display = self.format_peer(&peer_id);
                 println!("\n✓✓ Message delivered to {}\n", peer_display);
+            }
+            NetworkEvent::FileReceived { peer_id, file_name, file_path, size, .. } => {
+                let peer_display = self.format_peer(&peer_id);
+                println!("\n📎 File received from {}: {} ({} bytes)\n   Saved to: {}\n",
+                    peer_display, file_name, size, file_path);
+            }
+            NetworkEvent::FileTransferProgress { peer_id, transfer_id, chunks_done, total_chunks } => {
+                let pct = if total_chunks > 0 {
+                    (chunks_done as f32 / total_chunks as f32 * 100.0) as u32
+                } else { 0 };
+                let peer_display = self.format_peer(&peer_id);
+                println!("\n📊 Transfer [{}] to {}: {}% ({}/{})\n",
+                    &transfer_id[..8], peer_display, pct, chunks_done, total_chunks);
+            }
+            NetworkEvent::FileTransferFailed { peer_id, transfer_id, reason } => {
+                let peer_display = self.format_peer(&peer_id);
+                println!("\n❌ Transfer [{}] to {} failed: {}\n",
+                    &transfer_id[..8], peer_display, reason);
+            }
+            NetworkEvent::FileTransferCompleted { peer_id, transfer_id } => {
+                let peer_display = self.format_peer(&peer_id);
+                println!("\n✅ Transfer [{}] to {} completed\n",
+                    &transfer_id[..8], peer_display);
+            }
+            NetworkEvent::CallSignalReceived { peer_id, call_id, .. } => {
+                let peer_display = self.format_peer(&peer_id);
+                println!("\n📞 Call signal from {} (id: {})\n",
+                    peer_display, &call_id[..8]);
             }
         }
     }

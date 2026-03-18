@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use futures::prelude::*;
 use std::io;
 
+pub const FILE_CHUNK_SIZE: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     Text { context: String, timestamp: i64 },
@@ -13,6 +15,33 @@ pub enum Message {
 
     Ping,
     Pong,
+
+    FileOffer {
+        transfer_id: String,
+        file_name: String,
+        file_size: u64,
+        total_chunks: u32,
+        mime_type: Option<String>,
+        caption: String,
+        message_id: String,
+    },
+    FileChunk {
+        transfer_id: String,
+        chunk_index: u32,
+        data: Vec<u8>,
+    },
+    FileAck {
+        transfer_id: String,
+        chunk_index: u32,
+    },
+    FileComplete {
+        transfer_id: String,
+    },
+
+    CallSignal {
+        call_id: String,
+        signal_json: String,
+    },
 }
 
 #[derive(Debug, Clone)]
