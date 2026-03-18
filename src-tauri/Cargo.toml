@@ -25,3 +25,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Используем родительский проект как библиотеку
 videocalls = { path = ".." }
+tauri-plugin-dialog = "2"

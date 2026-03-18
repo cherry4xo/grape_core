@@ -5,10 +5,12 @@ pub mod commands;
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_peer_id,
             commands::get_contacts,
+            commands::get_chat_peers,
             commands::add_contact,
             commands::remove_contact,
             commands::rename_contact,
@@ -30,6 +32,10 @@ pub fn run() {
             commands::auth_save_seed,
             commands::auth_load_seed,
             commands::auth_unlock,
+            commands::send_file,
+            commands::get_file_transfers,
+            commands::open_file,
+            commands::send_call_signal,
         ])
         .setup(|app| {
             commands::setup(app)?;

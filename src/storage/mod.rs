@@ -13,6 +13,7 @@ pub struct StoredMessage {
     pub timestamp: i64,
     pub is_outgoing: bool,
     pub delivery_status: String,
+    pub file_transfer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,21 @@ pub struct Contact {
     pub name: Option<String>,
     pub last_seen: Option<i64>,
     pub is_manual: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransfer {
+    pub id: String,
+    pub chat_id: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub total_chunks: u32,
+    pub chunks_done: u32,
+    pub local_path: Option<String>,
+    pub is_outgoing: bool,
+    pub status: String,
+    pub timestamp: i64,
+    pub mime_type: Option<String>,
 }
 
 pub struct Storage {
@@ -76,6 +92,22 @@ impl Storage {
 
         messages.reverse();
         Ok(messages)
+    }
+
+    pub fn get_chat_peer_ids(&self) -> Result<Vec<(String, i64)>> {
+        let tree = self.db.open_tree("messages")?;
+        let mut latest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for item in tree.iter() {
+            let (_, value) = item?;
+            let msg: StoredMessage = bincode::deserialize(&value)?;
+            let entry = latest.entry(msg.chat_id).or_insert(0);
+            if msg.timestamp > *entry {
+                *entry = msg.timestamp;
+            }
+        }
+        let mut result: Vec<(String, i64)> = latest.into_iter().collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(result)
     }
 
     pub fn mark_peer_messages_delivered(&self, peer_id: &str) -> Result<()> {
@@ -267,6 +299,102 @@ impl Storage {
         Ok(None)
     }
 
+    pub fn save_file_transfer(&self, ft: &FileTransfer) -> Result<()> {
+        let tree = self.db.open_tree("file_transfers")?;
+        tree.insert(ft.id.as_bytes(), bincode::serialize(ft)?)?;
+        Ok(())
+    }
+
+    pub fn get_file_transfer(&self, transfer_id: &str) -> Result<Option<FileTransfer>> {
+        let tree = self.db.open_tree("file_transfers")?;
+        if let Some(v) = tree.get(transfer_id.as_bytes())? {
+            return Ok(Some(bincode::deserialize(&v)?));
+        }
+        Ok(None)
+    }
+
+    pub fn get_file_transfers_for_chat(&self, chat_id: &str) -> Result<Vec<FileTransfer>> {
+        let tree = self.db.open_tree("file_transfers")?;
+        let mut result = Vec::new();
+        for item in tree.iter() {
+            let (_, v) = item?;
+            let ft: FileTransfer = bincode::deserialize(&v)?;
+            if ft.chat_id == chat_id {
+                result.push(ft);
+            }
+        }
+        result.sort_by_key(|ft| ft.timestamp);
+        Ok(result)
+    }
+
+    pub fn update_file_transfer_status(&self, transfer_id: &str, status: &str) -> Result<()> {
+        let tree = self.db.open_tree("file_transfers")?;
+        if let Some(v) = tree.get(transfer_id.as_bytes())? {
+            let mut ft: FileTransfer = bincode::deserialize(&v)?;
+            ft.status = status.to_string();
+            tree.insert(transfer_id.as_bytes(), bincode::serialize(&ft)?)?;
+        }
+        Ok(())
+    }
+    
+    pub fn update_file_transfer_progress(&self, transfer_id: &str, chunks_done: u32) -> Result<()> {
+        let tree = self.db.open_tree("file_transfers")?;
+        if let Some(v) = tree.get(transfer_id.as_bytes())? {
+            let mut ft: FileTransfer = bincode::deserialize(&v)?;
+            ft.chunks_done = chunks_done;
+            tree.insert(transfer_id.as_bytes(), bincode::serialize(&ft)?)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_file_transfer_local_path(&self, transfer_id: &str, path: &str) -> Result<()> {
+        let tree = self.db.open_tree("file_transfers")?;
+        if let Some(v) = tree.get(transfer_id.as_bytes())? {
+            let mut ft: FileTransfer = bincode::deserialize(&v)?;
+            ft.local_path = Some(path.to_string());
+            ft.status = "completed".to_string();
+            tree.insert(transfer_id.as_bytes(), bincode::serialize(&ft)?)?;
+        }
+        Ok(())
+    }
+
+    pub fn save_pending_file_transfer(&self, peer_id: &str, transfer_id: &str, file_path: &str, caption: &str) -> Result<()> {
+        let tree = self.db.open_tree("pending_file_transfers")?;
+        let key = format!("{}_{}", peer_id, transfer_id);
+        let value = serde_json::json!({
+            "peer_id": peer_id,
+            "transfer_id": transfer_id,
+            "file_path": file_path,
+            "caption": caption,
+        }).to_string();
+        tree.insert(key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_pending_file_transfers(&self, peer_id: &str) -> Result<Vec<(String, String, String)>> {
+        // Returns Vec<(transfer_id, file_path, caption)>
+        let tree = self.db.open_tree("pending_file_transfers")?;
+        let prefix = format!("{}_", peer_id);
+        let mut result = Vec::new();
+        for item in tree.iter() {
+            let (key, value) = item?;
+            if String::from_utf8_lossy(&key).starts_with(&prefix) {
+                let json: serde_json::Value = serde_json::from_slice(&value)?;
+                let transfer_id = json["transfer_id"].as_str().unwrap_or("").to_string();
+                let file_path = json["file_path"].as_str().unwrap_or("").to_string();
+                let caption = json["caption"].as_str().unwrap_or("").to_string();
+                result.push((transfer_id, file_path, caption));
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn delete_pending_file_transfer(&self, peer_id: &str, transfer_id: &str) -> Result<()> {
+        let tree = self.db.open_tree("pending_file_transfers")?;
+        tree.remove(format!("{}_{}", peer_id, transfer_id).as_bytes())?;
+        Ok(())
+    }
+
     pub fn clear(&self) -> Result<()> {
         self.db.clear()?;
         Ok(())
@@ -293,6 +421,7 @@ mod tests {
             timestamp: 1234567890,
             is_outgoing: false,
             delivery_status: "sent".to_string(),
+            file_transfer_id: None,
         };
 
         storage.save_message(&message).unwrap();

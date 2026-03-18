@@ -6,8 +6,11 @@ import { ContactList } from './components/ContactList';
 import { ChatArea } from './components/ChatArea';
 import { AuthScreen } from './components/AuthScreen';
 import { api } from './api';
-import type { Contact } from './types';
+import type { CallType, Contact } from './types';
 import './styles/index.css';
+import { useWebRTC } from './hooks/useWebRTC';
+import { CallScreen } from './components/CallScreen';
+import { IncomingCallModal } from './components/IncomingCallModal';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -19,6 +22,25 @@ function App() {
   const [newContactName, setNewContactName] = useState('');
   const [contactsRefreshTrigger, setContactsRefreshTrigger] = useState(0);
   const [needsPassword, setNeedsPassword] = useState(false);
+
+  const {
+    callState, remoteVideoRef, localVideoRef,
+    startCall, answerCall, rejectCall, hangup,
+    toggleMute, toggleVideo, toggleScreenShare,
+    callMessages, sendCallMessage,
+  } = useWebRTC();
+
+  const handleStartCall = (callType: CallType) => {
+    if (!selectedContact) return;
+    startCall(selectedContact.peer_id, selectedContact.name, callType);
+  };
+
+  const handleAnswer = (callType: CallType) => {
+    if (!callState.peerId || !callState.callId) return;
+    // signal_json with offer SDP is stored in callState via useWebRTC internal ref
+    // answerCall needs the offerSdp — pass via a ref in the hook
+    answerCall(callState.peerId, callState.callId, callState.offerSdp!, callType);
+  };
 
   useEffect(() => {
     checkAuth();
@@ -144,7 +166,7 @@ function App() {
 
       <div className="main-content">
         {selectedContact ? (
-          <ChatArea contact={selectedContact} />
+          <ChatArea contact={selectedContact} onStartCall={handleStartCall}/>
         ) : (
           <div className="empty-state">
             Select a contact to start chatting
@@ -194,6 +216,26 @@ function App() {
             </form>
           </div>
         </div>
+      )}
+      {(callState.status === 'calling' || callState.status === 'connected') && (
+        <CallScreen
+          callState={callState}
+          remoteVideoRef={remoteVideoRef}
+          localVideoRef={localVideoRef}
+          onHangup={hangup}
+          onToggleMute={toggleMute}
+          onToggleVideo={toggleVideo}
+          onToggleScreen={toggleScreenShare}
+          callMessages={callMessages}
+          onSendCallMessage={sendCallMessage}
+        />
+      )}
+      {callState.status === 'ringing' && (
+        <IncomingCallModal
+          callState={callState}
+          onAnswer={handleAnswer}
+          onReject={() => rejectCall(callState.peerId!, callState.callId!)}
+        />
       )}
     </div>
   );

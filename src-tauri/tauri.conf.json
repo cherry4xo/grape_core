@@ -23,7 +23,8 @@
             "core:event:allow-listen",
             "core:event:allow-emit",
             "core:webview:allow-internal-toggle-devtools",
-            "shell:allow-open"
+            "shell:allow-open",
+            "dialog:allow-open"
           ]
         }
       ]
@@ -44,7 +45,10 @@
     "targets": "all",
     "icon": [
       "icons/icon.png"
-    ]
+    ],
+    "macOS": {
+      "infoPlist": "./Info.plist"
+    }
   },
   "plugins": {}
 }

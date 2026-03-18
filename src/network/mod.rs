@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use crate::identity::Identity;
 use crate::protocol::Message;
 use crate::crypto::MessageEncryption;
-use crate::storage::{Storage, StoredMessage};
+use crate::storage::{FileTransfer, Storage, StoredMessage};
 use anyhow::Result;
 use std::sync::Arc;
 use libp2p::{Multiaddr, PeerId, Swarm, autonat, gossipsub, identify, kad, request_response};
@@ -19,6 +19,12 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub enum NetworkCommand {
     SendMessage { peer_id: PeerId, message: String },
+    SendFile { peer_id: PeerId, file_path: std::path::PathBuf, caption: String },
+    SendCallSignal {
+        peer_id: PeerId,
+        call_id: String,
+        signal_json: String,
+    },
     Dial { address: Multiaddr },
     GetPeers,
     SubscribeChannel { topic: String },
@@ -42,6 +48,36 @@ pub enum NetworkEvent {
     ChannelMessage { topic: String, peer_id: PeerId, message: String},
     ListenAddrAdded { address: Multiaddr },
     MessageDelivered { peer_id: PeerId, message_id: String },
+    FileReceived {
+        peer_id: PeerId,
+        transfer_id: String,
+        message_id: String,
+        file_name: String,
+        file_path: String,
+        size: u64,
+        mime_type: Option<String>,
+        caption: String,
+    },
+    FileTransferProgress {
+        peer_id: PeerId,
+        transfer_id: String,
+        chunks_done: u32,
+        total_chunks: u32,
+    },
+    FileTransferFailed {
+        peer_id: PeerId,
+        transfer_id: String,
+        reason: String,
+    },
+    FileTransferCompleted {
+        peer_id: PeerId,
+        transfer_id: String,
+    },
+    CallSignalReceived {
+        peer_id: PeerId,
+        call_id: String,
+        signal_json: String,
+    },
 }
 
 pub struct P2PNetwork {
@@ -53,6 +89,10 @@ pub struct P2PNetwork {
     encryption: MessageEncryption,
     storage: Arc<Storage>,
     local_peer_id: PeerId,
+    pending_outgoing_chunks: HashMap<String, (PeerId, Vec<Vec<u8>>, u32)>,
+    pending_incoming_chunks: HashMap<String, (FileTransfer, HashMap<u32, Vec<u8>>)>,
+    pending_file_requests: HashMap<OutboundRequestId, (PeerId, String, u32)>,
+    downloads_dir: std::path::PathBuf,
 }
 
 impl P2PNetwork {
@@ -79,6 +119,10 @@ impl P2PNetwork {
         let pending_requests = HashMap::new();
         let encryption = MessageEncryption::new(keypair.clone());
 
+        let storage_base = std::env::var("VIDEOCALLS_STORAGE_PATH")
+            .unwrap_or_else(|_| "./videocalls/storage".to_string());
+        let downloads_dir = std::path::PathBuf::from(storage_base).join("downloads");
+
         Ok(Self {
             swarm,
             command_rx,
@@ -87,7 +131,11 @@ impl P2PNetwork {
             pending_requests,
             encryption,
             storage,
-            local_peer_id: peer_id
+            local_peer_id: peer_id,
+            pending_outgoing_chunks: HashMap::new(),
+            pending_incoming_chunks: HashMap::new(),
+            pending_file_requests: HashMap::new(),
+            downloads_dir,
         })
     }
 
@@ -149,6 +197,7 @@ impl P2PNetwork {
                                 timestamp: chrono::Utc::now().timestamp(),
                                 is_outgoing: true,
                                 delivery_status: status.to_string(),
+                                file_transfer_id: None,
                             };
                             if let Err(e) = self.storage.save_message(&stored_msg) {
                                 warn!("Failed to save message: {:?}", e);
@@ -254,6 +303,109 @@ impl P2PNetwork {
                             info!("🌐 NAT status information is logged via Autonat events");
                             info!("   Watch for 'NAT status changed' messages in the logs");
                         }
+
+                        NetworkCommand::SendFile { peer_id, file_path, caption } => {
+                            let file_name = file_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("file")
+                                .to_string();
+
+                            let mime_type = mime_guess::from_path(&file_path)
+                                .first()
+                                .map(|m| m.to_string());
+
+                            let bytes = match tokio::fs::read(&file_path).await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("Failed to read file {:?}: {:?}", file_path, e);
+                                    continue;
+                                }
+                            };
+
+                            let transfer_id = uuid::Uuid::new_v4().to_string();
+                            let message_id = uuid::Uuid::new_v4().to_string();
+                            let file_size = bytes.len() as u64;
+                            let use_encryption = keys_exchanged.get(&peer_id).copied().unwrap_or(false);
+
+                            // Split and encrypt each chunk with its index as nonce
+                            let mut encrypted_chunks: Vec<Vec<u8>> = Vec::new();
+                            for (i, chunk) in bytes.chunks(crate::protocol::FILE_CHUNK_SIZE).enumerate() {
+                                let encrypted = if use_encryption {
+                                    match self.encryption.encrypt_chunk(&peer_id, chunk, i as u64) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            warn!("Chunk encryption failed: {:?}", e);
+                                            chunk.to_vec()
+                                        }
+                                    }
+                                } else {
+                                    chunk.to_vec()
+                                };
+                                encrypted_chunks.push(encrypted);
+                            }
+
+                            let total_chunks = encrypted_chunks.len() as u32;
+                            let is_connected = self.swarm.is_connected(&peer_id);
+                            let status = if is_connected { "in_progress" } else { "queued" };
+
+                            let stored_msg = StoredMessage {
+                                id: message_id.clone(),
+                                chat_id: peer_id.to_string(),
+                                sender: self.local_peer_id.to_string(),
+                                content: caption.clone(),
+                                timestamp: chrono::Utc::now().timestamp(),
+                                is_outgoing: true,
+                                delivery_status: status.to_string(),
+                                file_transfer_id: Some(transfer_id.clone()),
+                            };
+                            let _ = self.storage.save_message(&stored_msg);
+
+                            let ft = crate::storage::FileTransfer {
+                                id: transfer_id.clone(),
+                                chat_id: peer_id.to_string(),
+                                file_name: file_name.clone(),
+                                file_size,
+                                total_chunks,
+                                chunks_done: 0,
+                                local_path: None,
+                                is_outgoing: true,
+                                status: status.to_string(),
+                                timestamp: chrono::Utc::now().timestamp(),
+                                mime_type: mime_type.clone(),
+                            };
+                            let _ = self.storage.save_file_transfer(&ft);
+
+                            if !is_connected {
+                                let _ = self.storage.save_pending_file_transfer(
+                                    &peer_id.to_string(),
+                                    &transfer_id,
+                                    &file_path.to_string_lossy(),
+                                    &caption,
+                                );
+                                info!("📬 Queued file transfer for offline peer {}", peer_id);
+                            } else {
+                                let msg = crate::protocol::Message::FileOffer {
+                                    transfer_id: transfer_id.clone(),
+                                    file_name,
+                                    file_size,
+                                    total_chunks,
+                                    mime_type,
+                                    caption,
+                                    message_id,
+                                };
+                                let request_id = self.swarm.behaviour_mut().request_response
+                                    .send_request(&peer_id, msg);
+                                self.pending_file_requests.insert(request_id, (peer_id, transfer_id.clone(), u32::MAX));
+                                self.pending_outgoing_chunks.insert(transfer_id, (peer_id, encrypted_chunks, 0));
+                                info!("📤 Sent FileOffer to {}", peer_id);
+                            }
+                        }
+
+                        NetworkCommand::SendCallSignal { peer_id, call_id, signal_json } => {
+                            let msg = crate::protocol::Message::CallSignal { call_id, signal_json };
+                            self.swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
+                        }
                     }
                 }
 
@@ -332,6 +484,60 @@ impl P2PNetwork {
                                 let _ = self.storage.delete_pending_message(&peer_id.to_string(), &msg_id);
                                 let _ = self.storage.update_message_status(&msg_id, "sent");
                             }
+
+                            let pending_files = self.storage.get_pending_file_transfers(&peer_id.to_string())
+                                .unwrap_or_default();
+                            for (transfer_id, file_path_str, caption) in pending_files {
+                                let file_path = std::path::PathBuf::from(&file_path_str);
+                                let bytes = match tokio::fs::read(&file_path).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!("❌ Failed to re-read queued file {:?}: {:?}", file_path, e);
+                                        let _ = self.storage.update_file_transfer_status(&transfer_id, "failed");
+                                        let _ = self.storage.delete_pending_file_transfer(&peer_id.to_string(), &transfer_id);
+                                        continue;
+                                    }
+                                };
+
+                                let use_encryption = keys_exchanged.get(&peer_id).copied().unwrap_or(false);
+                                let mut encrypted_chunks: Vec<Vec<u8>> = Vec::new();
+
+                                for (i, chunk) in bytes.chunks(crate::protocol::FILE_CHUNK_SIZE).enumerate() {
+                                    let c = if use_encryption {
+                                        self.encryption.encrypt_chunk(&peer_id, chunk, i as u64).unwrap_or_else(|_| chunk.to_vec())
+                                    } else {
+                                        chunk.to_vec()
+                                    };
+                                    encrypted_chunks.push(c);
+                                }
+
+                                let total_chunks = encrypted_chunks.len() as u32;
+
+                                if let Ok(Some(ft)) = self.storage.get_file_transfer(&transfer_id) {
+                                    // Find the message_id linked to this transfer
+                                    let message_id = self.storage.get_messages(&ft.chat_id, 200)
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .find(|m| m.file_transfer_id.as_deref() == Some(&transfer_id))
+                                        .map(|m| m.id)
+                                        .unwrap_or_else(|| transfer_id.clone());
+                                    let msg = crate::protocol::Message::FileOffer {
+                                        transfer_id: transfer_id.clone(),
+                                        file_name: ft.file_name.clone(),
+                                        file_size: ft.file_size,
+                                        total_chunks,
+                                        mime_type: ft.mime_type.clone(),
+                                        caption,
+                                        message_id,
+                                    };
+                                    let request_id = self.swarm.behaviour_mut().request_response
+                                        .send_request(&peer_id, msg);
+                                    self.pending_file_requests.insert(request_id, (peer_id, transfer_id.clone(), u32::MAX));
+                                    self.pending_outgoing_chunks.insert(transfer_id.clone(), (peer_id, encrypted_chunks, 0));
+                                    let _ = self.storage.update_file_transfer_status(&transfer_id, "in_progress");
+                                    let _ = self.storage.delete_pending_file_transfer(&peer_id.to_string(), &transfer_id);
+                                }
+                            }
                         }
 
                         SwarmEvent::ConnectionClosed { peer_id, cause, ..} => {
@@ -397,6 +603,7 @@ impl P2PNetwork {
                                                 timestamp: *timestamp,
                                                 is_outgoing: false,
                                                 delivery_status: "delivered".to_string(),
+                                                file_transfer_id: None,
                                             };
 
                                             if let Err(e) = self.storage.save_message(&stored_msg) {
@@ -431,6 +638,7 @@ impl P2PNetwork {
                                                         timestamp: *timestamp,
                                                         is_outgoing: false,
                                                         delivery_status: "delivered".to_string(),
+                                                        file_transfer_id: None,
                                                     };
 
                                                     if let Err(e) = self.storage.save_message(&stored_msg) {
@@ -452,6 +660,151 @@ impl P2PNetwork {
                                                 .behaviour_mut()
                                                 .request_response
                                                 .send_response(channel, response);
+                                        }
+
+                                        Message::FileOffer { transfer_id, file_name, file_size, total_chunks, mime_type, caption, message_id } => {
+                                            info!("📥 FileOffer from {}: {} ({} bytes, {} chunks)", peer, file_name, file_size, total_chunks);
+
+                                            let stored_msg = StoredMessage {
+                                                id: message_id.clone(),
+                                                chat_id: peer.to_string(),
+                                                sender: peer.to_string(),
+                                                content: caption.clone(),
+                                                timestamp: chrono::Utc::now().timestamp(),
+                                                is_outgoing: false,
+                                                delivery_status: "delivered".to_string(),
+                                                file_transfer_id: Some(transfer_id.clone()),
+                                            };
+                                            let _ = self.storage.save_message(&stored_msg);
+
+                                            let ft = crate::storage::FileTransfer {
+                                                id: transfer_id.clone(),
+                                                chat_id: peer.to_string(),
+                                                file_name: file_name.clone(),
+                                                file_size: *file_size,
+                                                total_chunks: *total_chunks,
+                                                chunks_done: 0,
+                                                local_path: None,
+                                                is_outgoing: false,
+                                                status: "in_progress".to_string(),
+                                                timestamp: chrono::Utc::now().timestamp(),
+                                                mime_type: mime_type.clone(),
+                                            };
+                                            let _ = self.storage.save_file_transfer(&ft);
+                                            self.pending_incoming_chunks.insert(
+                                                transfer_id.clone(),
+                                                (ft, HashMap::new()),
+                                            );
+
+                                            let _ = self.event_tx.send(NetworkEvent::FileTransferProgress {
+                                                peer_id: peer,
+                                                transfer_id: transfer_id.clone(),
+                                                chunks_done: 0,
+                                                total_chunks: *total_chunks,
+                                            });
+
+                                            let _ = self.swarm.behaviour_mut().request_response
+                                                .send_response(channel, Message::Pong);
+                                        }
+
+                                        Message::FileChunk { transfer_id, chunk_index, data } => {
+                                            if let Some((ft, chunks_map)) = self.pending_incoming_chunks.get_mut(transfer_id) {
+                                                // Decrypt using chunk_index as nonce (matches sender's encrypt_chunk)
+                                                let decrypted = if keys_exchanged.get(&peer).copied().unwrap_or(false) {
+                                                    match self.encryption.decrypt_chunk(&peer, data, *chunk_index as u64) {
+                                                        Ok(d) => d,
+                                                        Err(e) => {
+                                                            warn!("Chunk decryption failed: {:?}", e);
+                                                            data.clone()
+                                                        }
+                                                    }
+                                                } else {
+                                                    data.clone()
+                                                };
+                                                chunks_map.insert(*chunk_index, decrypted);
+
+                                                let chunks_done = chunks_map.len() as u32;
+                                                let total_chunks = ft.total_chunks;
+                                                let transfer_id_clone = transfer_id.clone();
+
+                                                let _ = self.storage.update_file_transfer_progress(transfer_id, chunks_done);
+                                                let _ = self.event_tx.send(NetworkEvent::FileTransferProgress {
+                                                    peer_id: peer,
+                                                    transfer_id: transfer_id_clone,
+                                                    chunks_done,
+                                                    total_chunks,
+                                                });
+                                            }
+
+                                            let _ = self.swarm.behaviour_mut().request_response
+                                                .send_response(channel, Message::FileAck {
+                                                    transfer_id: transfer_id.clone(),
+                                                    chunk_index: *chunk_index,
+                                                });
+                                        }
+
+                                        Message::FileComplete { transfer_id } => {
+                                            if let Some((ft, chunks_map)) = self.pending_incoming_chunks.remove(transfer_id) {
+                                                // Assemble chunks in order
+                                                let mut assembled: Vec<u8> = Vec::with_capacity(ft.file_size as usize);
+                                                for i in 0..ft.total_chunks {
+                                                    if let Some(chunk) = chunks_map.get(&i) {
+                                                        assembled.extend_from_slice(chunk);
+                                                    } else {
+                                                        warn!("Missing chunk {} for transfer {}", i, transfer_id);
+                                                    }
+                                                }
+
+                                                // Write to disk
+                                                let out_dir = self.downloads_dir.join(transfer_id);
+                                                let out_path = out_dir.join(&ft.file_name);
+                                                match tokio::fs::create_dir_all(&out_dir).await
+                                                    .and(tokio::fs::write(&out_path, &assembled).await)
+                                                {
+                                                    Ok(_) => {
+                                                        let path_str = out_path.to_string_lossy().to_string();
+                                                        let _ = self.storage.set_file_transfer_local_path(transfer_id, &path_str);
+                                                        info!("✅ File saved: {}", path_str);
+                                                        let message_id = self.storage.get_messages(&ft.chat_id, 200)
+                                                            .unwrap_or_default()
+                                                            .into_iter()
+                                                            .find(|m| m.file_transfer_id.as_deref() == Some(transfer_id))
+                                                            .map(|m| m.id)
+                                                            .unwrap_or_else(|| transfer_id.clone());
+                                                        let _ = self.event_tx.send(NetworkEvent::FileReceived {
+                                                            peer_id: peer,
+                                                            transfer_id: transfer_id.clone(),
+                                                            message_id,
+                                                            file_name: ft.file_name.clone(),
+                                                            file_path: path_str,
+                                                            size: ft.file_size,
+                                                            mime_type: ft.mime_type.clone(),
+                                                            caption: String::new(),
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to write file: {:?}", e);
+                                                        let _ = self.storage.update_file_transfer_status(transfer_id, "failed");
+                                                        let _ = self.event_tx.send(NetworkEvent::FileTransferFailed {
+                                                            peer_id: peer,
+                                                            transfer_id: transfer_id.clone(),
+                                                            reason: e.to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+
+                                            let _ = self.swarm.behaviour_mut().request_response
+                                                .send_response(channel, Message::Pong);
+                                        }
+
+                                        Message::CallSignal { call_id, signal_json } => {
+                                            let _ = self.event_tx.send(NetworkEvent::CallSignalReceived {
+                                                peer_id: peer,
+                                                call_id: call_id.clone(),
+                                                signal_json: signal_json.clone(),
+                                            });
+                                            let _ = self.swarm.behaviour_mut().request_response.send_response(channel, Message::Pong);
                                         }
 
                                         _ => {
@@ -478,12 +831,69 @@ impl P2PNetwork {
                                             }
                                         }
                                         Message::Pong => {
-                                            if let Some((_, Some(msg_id))) = pending {
+                                            if let Some((_, Some(msg_id))) = &pending {
                                                 let _ = self.storage.update_message_status(&msg_id, "delivered");
                                                 let _ = self.event_tx.send(NetworkEvent::MessageDelivered {
                                                     peer_id: peer,
-                                                    message_id: msg_id,
+                                                    message_id: msg_id.clone(),
                                                 });
+                                            }
+
+                                            if let Some((_, transfer_id, chunk_index)) = self.pending_file_requests.remove(&request_id) {
+                                                if chunk_index == u32::MAX {
+                                                    if let Some((_, chunks, _)) = self.pending_outgoing_chunks.get_mut(&transfer_id) {
+                                                        if !chunks.is_empty() {
+                                                            let chunk_data = chunks[0].clone();
+                                                            let msg = Message::FileChunk {
+                                                                transfer_id: transfer_id.clone(),
+                                                                chunk_index: 0,
+                                                                data: chunk_data,
+                                                            };
+                                                            let req_id = self.swarm.behaviour_mut().request_response.send_request(&peer, msg);
+
+                                                            self.pending_file_requests.insert(req_id, (peer, transfer_id, 0));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Message::FileAck { transfer_id, chunk_index } => {
+                                            let next_index = chunk_index + 1;
+                                            if let Some((peer_id, chunks, _)) = self.pending_outgoing_chunks.get_mut(&transfer_id) {
+                                                let total = chunks.len() as u32;
+                                                let _ = self.storage.update_file_transfer_progress(&transfer_id, next_index);
+                                                let _ = self.event_tx.send(NetworkEvent::FileTransferProgress {
+                                                    peer_id: *peer_id,
+                                                    transfer_id: transfer_id.clone(),
+                                                    chunks_done: next_index,
+                                                    total_chunks: total,
+                                                });
+
+                                                if next_index >= total {
+                                                    let msg = Message::FileComplete { transfer_id: transfer_id.clone() };
+                                                    let p = *peer_id;
+                                                    let req_id = self.swarm.behaviour_mut().request_response.send_request(&p, msg);
+                                                    // u32::MAX signals FileComplete ACK — same as FileOffer ACK
+                                                    self.pending_file_requests.insert(req_id, (p, transfer_id.clone(), u32::MAX));
+                                                    // Mark completed in storage and notify UI
+                                                    let _ = self.storage.update_file_transfer_status(&transfer_id, "completed");
+                                                    let _ = self.event_tx.send(NetworkEvent::FileTransferCompleted {
+                                                        peer_id: *peer_id,
+                                                        transfer_id: transfer_id.clone(),
+                                                    });
+                                                    self.pending_outgoing_chunks.remove(&transfer_id);
+                                                } else {
+                                                    let chunk_data = chunks[next_index as usize].clone();
+                                                    let p = *peer_id;
+                                                    let tid = transfer_id.clone();
+                                                    let msg = Message::FileChunk {
+                                                        transfer_id: tid.clone(),
+                                                        chunk_index: next_index,
+                                                        data: chunk_data,
+                                                    };
+                                                    let req_id = self.swarm.behaviour_mut().request_response.send_request(&p, msg);
+                                                    self.pending_file_requests.insert(req_id, (p, tid, next_index));
+                                                }
                                             }
                                         }
                                         _ => {
